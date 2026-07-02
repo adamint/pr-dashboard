@@ -1073,7 +1073,7 @@ function App() {
       );
       setAgentReviewQueueItems((current) =>
         current
-          ?.map((item) => {
+          ? current.map((item) => {
             const headSha = item.pullRequest.headSha;
             if (!headSha) {
               return item;
@@ -1082,7 +1082,8 @@ function App() {
             const checks = checksByKey.get(checksRequestKey(item.pullRequest.repository, item.pullRequest.number, headSha));
             return checks ? { ...item, pullRequest: { ...item.pullRequest, checks } } : item;
           })
-          .filter((item) => !isChecksFailing(item.pullRequest)) ?? current);
+            .filter((item) => !isChecksFailing(item.pullRequest))
+          : current);
       setShipWeek((current) =>
         current
           ? {

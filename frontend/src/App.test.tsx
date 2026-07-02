@@ -565,6 +565,26 @@ describe('App navigation', () => {
     await unmountApp(root);
   });
 
+  it('keeps visible check enrichment safe before an agent review queue is loaded', async () => {
+    window.history.replaceState(null, '', '/');
+    const fetchMock = createFetchMock({
+      authenticated: true,
+      checksState: 'unknown',
+      visibleChecksState: 'success',
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { root } = await renderApp();
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain('Fix dashboard navigation');
+      expect(checksRequestUrls(fetchMock)).toHaveLength(1);
+    });
+    expect(requestUrls(fetchMock, '/api/agents/review-queue')).toHaveLength(1);
+
+    await unmountApp(root);
+  });
+
   it('falls back to client focus when the agent queue has partial repository errors', async () => {
     window.history.replaceState(null, '', '/');
     const serverQueueWinner = createPullRequest('success', {
