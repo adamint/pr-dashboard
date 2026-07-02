@@ -18,57 +18,78 @@ static class AgentReviewQueueRoutes
                 return Results.ValidationProblem(errors);
             }
 
-            var responses = new List<PullRequestListResponse>();
-            var repositoryResults = new List<AgentReviewQueueRepositoryResult>();
-            var forceRefresh = refresh == true;
-            foreach (var repository in repositories)
-            {
-                try
-                {
-                    var response = await pullRequests.GetPullRequestsGraphQlSnapshotAsync(
-                        repository,
-                        "open",
-                        forceRefresh,
-                        cancellationToken);
-                    responses.Add(response);
-                    repositoryResults.Add(new(
-                        repository.ToString(),
-                        response.PullRequests.Count,
-                        response.Snapshot,
-                        Error: null));
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
-                {
-                    repositoryResults.Add(new(
-                        repository.ToString(),
-                        PullRequestCount: 0,
-                        Snapshot: null,
-                        Error: ex.Message));
-                }
-            }
-
-            if (responses.Count == 0 && repositoryResults.Count > 0)
-            {
-                return Results.Problem(
-                    title: "Agent review queue unavailable",
-                    detail: string.Join(" ", repositoryResults.Select(result => $"{result.Repository}: {result.Error}")),
-                    statusCode: StatusCodes.Status503ServiceUnavailable);
-            }
-
-            var queue = AgentReviewQueueBuilder.Build(
-                responses,
+            return await BuildReviewQueueResponseAsync(
+                repositories,
                 dashboardOptions.Value,
+                refresh == true,
+                limit.GetValueOrDefault(10),
+                (repository, forceRefresh, token) => pullRequests.GetPullRequestsGraphQlSnapshotAsync(
+                    repository,
+                    "open",
+                    forceRefresh,
+                    token),
                 DateTimeOffset.UtcNow,
-                limit.GetValueOrDefault(10));
-
-            return Results.Ok(new AgentReviewQueueResponse(
-                queue.Items,
-                repositoryResults,
-                queue.TotalCount,
-                DateTimeOffset.UtcNow));
+                cancellationToken);
         });
 
         return endpoints;
+    }
+
+    internal static async Task<IResult> BuildReviewQueueResponseAsync(
+        IReadOnlyList<RepositoryName> repositories,
+        DashboardOptions dashboardOptions,
+        bool forceRefresh,
+        int limit,
+        Func<RepositoryName, bool, CancellationToken, Task<PullRequestListResponse>> loadPullRequests,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var responses = new List<PullRequestListResponse>();
+        var repositoryResults = new List<AgentReviewQueueRepositoryResult>();
+        foreach (var repository in repositories)
+        {
+            try
+            {
+                var response = await loadPullRequests(
+                    repository,
+                    forceRefresh,
+                    cancellationToken);
+                responses.Add(response);
+                repositoryResults.Add(new(
+                    repository.ToString(),
+                    response.PullRequests.Count,
+                    response.Snapshot,
+                    Error: null));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                repositoryResults.Add(new(
+                    repository.ToString(),
+                    PullRequestCount: 0,
+                    Snapshot: null,
+                    Error: ex.Message));
+            }
+        }
+
+        if (responses.Count == 0 && repositoryResults.Count > 0)
+        {
+            return Results.Problem(
+                title: "Agent review queue unavailable",
+                detail: string.Join(" ", repositoryResults.Select(result => $"{result.Repository}: {result.Error}")),
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+
+        var queue = AgentReviewQueueBuilder.Build(
+            responses,
+            dashboardOptions,
+            now,
+            limit);
+
+        return Results.Ok(new AgentReviewQueueResponse(
+            queue.Items,
+            repositoryResults,
+            queue.TotalCount,
+            now));
     }
 
     private static bool TryResolveRepositories(
@@ -535,20 +556,21 @@ static class AgentReviewQueueBuilder
     private static int ChangedLineCount(PullRequestSummary pullRequest) =>
         pullRequest.Additions + pullRequest.Deletions;
 
-    private static bool TargetsCurrentRelease(PullRequestSummary pullRequest, DashboardOptions options)
+    internal static bool TargetsCurrentRelease(PullRequestSummary pullRequest, DashboardOptions options)
     {
         if (string.IsNullOrWhiteSpace(options.CurrentRelease))
         {
             return false;
         }
 
-        return ReleaseSignalMatches(pullRequest.Title, options.CurrentRelease)
-            || ReleaseSignalMatches(pullRequest.Milestone, options.CurrentRelease)
-            || pullRequest.Labels.Any(label => ReleaseSignalMatches(label, options.CurrentRelease))
+        var currentRelease = options.CurrentRelease.Trim();
+        return ReleaseSignalMatches(pullRequest.Title, currentRelease)
+            || ReleaseSignalMatches(pullRequest.Milestone, currentRelease)
+            || pullRequest.Labels.Any(label => ReleaseSignalMatches(label, currentRelease))
             || pullRequest.LinkedIssues.Any(issue =>
-                ReleaseSignalMatches(issue.Title, options.CurrentRelease)
-                || ReleaseSignalMatches(issue.Milestone, options.CurrentRelease)
-                || issue.Labels.Any(label => ReleaseSignalMatches(label, options.CurrentRelease)));
+                ReleaseSignalMatches(issue.Title, currentRelease)
+                || ReleaseSignalMatches(issue.Milestone, currentRelease)
+                || issue.Labels.Any(label => ReleaseSignalMatches(label, currentRelease)));
     }
 
     private static bool ReleaseSignalMatches(string? value, string release) =>

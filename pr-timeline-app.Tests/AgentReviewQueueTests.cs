@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Http;
+
 namespace pr_timeline_app.Tests;
 
 public sealed class AgentReviewQueueTests
@@ -210,6 +212,34 @@ public sealed class AgentReviewQueueTests
         var item = Assert.Single(queue.Items);
         Assert.Equal(15, item.PullRequest.Number);
         Assert.Equal("Approved but aging", item.BucketLabel);
+    }
+
+    [Fact]
+    public void TargetsCurrentReleaseTrimsConfiguredRelease()
+    {
+        var options = new DashboardOptions { CurrentRelease = " 13.4 " };
+
+        Assert.True(AgentReviewQueueBuilder.TargetsCurrentRelease(
+            Pr(18, "Fix release 13.4 notes", "alice"),
+            options));
+    }
+
+    [Fact]
+    public async Task BuildReviewQueueResponseReturnsServiceUnavailableWhenAllRepositoriesFail()
+    {
+        Assert.True(RepositoryName.TryParse("microsoft/aspire", out var repository));
+
+        var result = await AgentReviewQueueRoutes.BuildReviewQueueResponseAsync(
+            [repository],
+            new DashboardOptions(),
+            forceRefresh: false,
+            limit: 10,
+            static (_, _, _) => throw new InvalidOperationException("public cache unavailable"),
+            s_now,
+            TestContext.Current.CancellationToken);
+
+        var statusResult = Assert.IsAssignableFrom<IStatusCodeHttpResult>(result);
+        Assert.Equal(StatusCodes.Status503ServiceUnavailable, statusResult.StatusCode);
     }
 
     private static PullRequestSummary Pr(
