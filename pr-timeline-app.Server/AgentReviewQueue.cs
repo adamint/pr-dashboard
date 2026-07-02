@@ -1,0 +1,697 @@
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+
+static class AgentReviewQueueRoutes
+{
+    public static IEndpointRouteBuilder MapAgentReviewQueueRoutes(this IEndpointRouteBuilder endpoints)
+    {
+        endpoints.MapGet("/api/agents/review-queue", async (
+            [FromQuery] string? repo,
+            [FromQuery] bool? refresh,
+            [FromQuery] int? limit,
+            IOptions<DashboardOptions> dashboardOptions,
+            GitHubPullRequestService pullRequests,
+            CancellationToken cancellationToken) =>
+        {
+            if (!TryResolveRepositories(repo, dashboardOptions.Value.Repositories, out var repositories, out var errors))
+            {
+                return Results.ValidationProblem(errors);
+            }
+
+            var responses = new List<PullRequestListResponse>();
+            var repositoryResults = new List<AgentReviewQueueRepositoryResult>();
+            var forceRefresh = refresh == true;
+            foreach (var repository in repositories)
+            {
+                try
+                {
+                    var response = await pullRequests.GetPullRequestsGraphQlSnapshotAsync(
+                        repository,
+                        "open",
+                        forceRefresh,
+                        cancellationToken);
+                    responses.Add(response);
+                    repositoryResults.Add(new(
+                        repository.ToString(),
+                        response.PullRequests.Count,
+                        response.Snapshot,
+                        Error: null));
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                {
+                    repositoryResults.Add(new(
+                        repository.ToString(),
+                        PullRequestCount: 0,
+                        Snapshot: null,
+                        Error: ex.Message));
+                }
+            }
+
+            if (responses.Count == 0 && repositoryResults.Count > 0)
+            {
+                return Results.Problem(
+                    title: "Agent review queue unavailable",
+                    detail: string.Join(" ", repositoryResults.Select(result => $"{result.Repository}: {result.Error}")),
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+
+            var queue = AgentReviewQueueBuilder.Build(
+                responses,
+                dashboardOptions.Value,
+                DateTimeOffset.UtcNow,
+                limit.GetValueOrDefault(10));
+
+            return Results.Ok(new AgentReviewQueueResponse(
+                queue.Items,
+                repositoryResults,
+                queue.TotalCount,
+                DateTimeOffset.UtcNow));
+        });
+
+        return endpoints;
+    }
+
+    private static bool TryResolveRepositories(
+        string? repo,
+        IReadOnlyList<string> configuredRepositories,
+        out IReadOnlyList<RepositoryName> repositories,
+        out Dictionary<string, string[]> errors)
+    {
+        var inputs = string.IsNullOrWhiteSpace(repo)
+            ? configuredRepositories
+            : repo.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var parsed = new List<RepositoryName>();
+        var invalid = new List<string>();
+
+        foreach (var input in inputs.Where(input => !string.IsNullOrWhiteSpace(input)))
+        {
+            if (RepositoryName.TryParse(input, out var repositoryName))
+            {
+                parsed.Add(repositoryName);
+            }
+            else
+            {
+                invalid.Add(input);
+            }
+        }
+
+        repositories = parsed;
+        errors = [];
+        if (invalid.Count > 0)
+        {
+            errors["repo"] = [$"Invalid repository value(s): {string.Join(", ", invalid)}. Use owner/repo."];
+        }
+        else if (parsed.Count == 0)
+        {
+            errors["repo"] = ["Configure at least one dashboard repository or pass repo=owner/repo."];
+        }
+
+        return errors.Count == 0;
+    }
+}
+
+static class AgentReviewQueueBuilder
+{
+    private static readonly TimeSpan s_approvedAging = TimeSpan.FromDays(2);
+    private static readonly TimeSpan s_focusAgeLimit = TimeSpan.FromDays(14);
+    private static readonly TimeSpan s_stalledPullRequest = TimeSpan.FromDays(7);
+    private static readonly TimeSpan s_recentlyUpdatedWindow = TimeSpan.FromDays(2);
+    private const int QuickWinLineThreshold = 80;
+    private const int QuickWinFileThreshold = 3;
+    private const string ApprovedButAgingBucketLabel = "Approved but aging";
+    private const string RegressionBucketLabel = "Regression";
+    private const string AgedOutCommunityBucketLabel = "Aged out community";
+
+    private static readonly HashSet<string> s_excludedFocusBucketLabels = new(StringComparer.Ordinal)
+    {
+        "Stalled",
+        "Draft",
+        "My draft PRs",
+        "Docs",
+        "Community Toolkit",
+        "Bots / automation",
+        "Community",
+        AgedOutCommunityBucketLabel,
+        "Unresolved feedback",
+        "Merge conflicts",
+        "CI failing",
+        "Author response"
+    };
+
+    private static readonly HashSet<string> s_disqualifyingFocusBucketLabels = new(StringComparer.Ordinal)
+    {
+        "Draft",
+        "My draft PRs",
+        "Docs",
+        "Community Toolkit",
+        "Bots / automation",
+        "Community",
+        AgedOutCommunityBucketLabel,
+        "Unresolved feedback",
+        "Merge conflicts"
+    };
+
+    private static readonly Dictionary<string, int> s_focusBucketRanks = new(StringComparer.Ordinal)
+    {
+        [RegressionBucketLabel] = -2,
+        [ApprovedButAgingBucketLabel] = 0,
+        ["Re-review needed"] = 1,
+        ["Ready to merge"] = 2,
+        ["Author response"] = 3,
+        ["Needs review"] = 4,
+        ["Quick wins"] = 5,
+        ["Review started"] = 6
+    };
+
+    private static readonly Dictionary<string, int> s_listBucketRanks = new(StringComparer.Ordinal)
+    {
+        ["CI failing"] = -1,
+        [ApprovedButAgingBucketLabel] = 0,
+        ["Re-review needed"] = 1,
+        ["Ready to merge"] = 2,
+        ["Author response"] = 3,
+        ["Needs review"] = 4,
+        ["Quick wins"] = 5,
+        ["Review started"] = 6
+    };
+
+    public static AgentReviewQueue Build(
+        IReadOnlyList<PullRequestListResponse> responses,
+        DashboardOptions options,
+        DateTimeOffset now,
+        int limit = 10)
+    {
+        var candidates = responses
+            .SelectMany(response => response.PullRequests.Select(pullRequest => new AgentReviewQueueCandidate(response.Repository, pullRequest)))
+            .ToArray();
+        var bucketItems = new List<AgentReviewQueueItem>();
+        var bucketLabelsByKey = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var candidate in candidates.Where(candidate =>
+            candidate.PullRequest.State.Equals("open", StringComparison.OrdinalIgnoreCase)
+            && !HasNeedsAuthorActionLabel(candidate.PullRequest, options)))
+        {
+            foreach (var label in ReviewBucketLabels(candidate, options, now))
+            {
+                if (!bucketLabelsByKey.TryGetValue(Key(candidate), out var labels))
+                {
+                    labels = [];
+                    bucketLabelsByKey[Key(candidate)] = labels;
+                }
+
+                labels.Add(label);
+                bucketItems.Add(new AgentReviewQueueItem(
+                    candidate.Repository,
+                    candidate.PullRequest,
+                    label,
+                    ReviewSignal(candidate.PullRequest, label)));
+            }
+        }
+
+        var blockedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, labels) in bucketLabelsByKey)
+        {
+            if (labels.Any(label => s_disqualifyingFocusBucketLabels.Contains(label))
+                || IsWaitingOnAuthor(labels))
+            {
+                blockedKeys.Add(key);
+            }
+        }
+
+        var dedupedItemsByKey = new Dictionary<string, AgentReviewQueueItem>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in bucketItems.Where(item => !s_excludedFocusBucketLabels.Contains(item.BucketLabel)))
+        {
+            var candidate = new AgentReviewQueueCandidate(item.Repository, item.PullRequest);
+            var key = Key(candidate);
+            if (blockedKeys.Contains(key))
+            {
+                continue;
+            }
+
+            if (!dedupedItemsByKey.TryGetValue(key, out var existing)
+                || FocusBucketRank(item.BucketLabel) < FocusBucketRank(existing.BucketLabel))
+            {
+                dedupedItemsByKey[key] = item;
+            }
+        }
+
+        var orderedItems = dedupedItemsByKey.Values
+            .Where(item => IsPullRequestWithinFocusAgeLimit(item.PullRequest, item.BucketLabel, now))
+            .Where(item => !IsCommunityPullRequest(new AgentReviewQueueCandidate(item.Repository, item.PullRequest), options, now))
+            .Where(item => !IsChecksFailing(new AgentReviewQueueCandidate(item.Repository, item.PullRequest), options))
+            .Order(AgentReviewQueueItemComparer.Create(now))
+            .ToArray();
+
+        return new AgentReviewQueue(
+            orderedItems.Take(Math.Max(1, limit)).ToArray(),
+            orderedItems.Length);
+    }
+
+    private static IReadOnlyList<string> ReviewBucketLabels(
+        AgentReviewQueueCandidate candidate,
+        DashboardOptions options,
+        DateTimeOffset now)
+    {
+        var pullRequest = candidate.PullRequest;
+        var labels = new List<string>();
+        if (HasRegressionSignal(pullRequest))
+        {
+            labels.Add(RegressionBucketLabel);
+        }
+
+        if (pullRequest.Draft)
+        {
+            labels.Add("Draft");
+            return labels;
+        }
+
+        if (IsCommunityPullRequest(candidate, options, now) && !IsAgedOutCommunityPullRequest(candidate, options, now))
+        {
+            return labels;
+        }
+
+        if (IsBotAuthor(pullRequest.Author, options))
+        {
+            labels.Add("Bots / automation");
+        }
+
+        if (IsGeneratedDocsPullRequest(candidate, options))
+        {
+            labels.Add("Docs");
+        }
+
+        if (IsConfiguredCommunityRepository(candidate.Repository, options))
+        {
+            labels.Add("Community Toolkit");
+        }
+
+        var ciFailing = IsChecksFailing(candidate, options);
+        if (ciFailing)
+        {
+            labels.Add("CI failing");
+        }
+
+        var mergeConflicts = HasMergeConflicts(pullRequest);
+        if (mergeConflicts)
+        {
+            labels.Add("Merge conflicts");
+        }
+
+        var approvedButAging = IsApprovedButAging(pullRequest, now);
+        if (approvedButAging)
+        {
+            labels.Add(ApprovedButAgingBucketLabel);
+        }
+
+        var unresolvedFeedback = pullRequest.Review.UnresolvedThreadCount > 0;
+        if (unresolvedFeedback)
+        {
+            labels.Add("Unresolved feedback");
+        }
+
+        var unresolvedFeedbackBlocksMerge = unresolvedFeedback && pullRequest.Review.RequiresConversationResolution;
+        if (pullRequest.Review.State.Equals("approved", StringComparison.OrdinalIgnoreCase)
+            && !approvedButAging
+            && !ciFailing
+            && !IsChecksPending(candidate, options)
+            && !unresolvedFeedbackBlocksMerge
+            && !mergeConflicts
+            && !HasNeedsAuthorActionLabel(pullRequest, options))
+        {
+            labels.Add("Ready to merge");
+        }
+
+        if (NeedsReReview(pullRequest))
+        {
+            labels.Add("Re-review needed");
+        }
+
+        if (pullRequest.Review.State.Equals("changes_requested", StringComparison.OrdinalIgnoreCase))
+        {
+            labels.Add("Author response");
+        }
+
+        if (IsIdle(pullRequest, now))
+        {
+            labels.Add("Stalled");
+        }
+
+        if (IsCommunityPullRequest(candidate, options, now))
+        {
+            labels.Add(IsAgedOutCommunityPullRequest(candidate, options, now) ? AgedOutCommunityBucketLabel : "Community");
+        }
+
+        if (IsQuickWin(candidate, options, now) && !ciFailing)
+        {
+            labels.Add("Quick wins");
+        }
+
+        if (NeedsReview(candidate, options))
+        {
+            labels.Add("Needs review");
+        }
+
+        if (labels.Count == 0)
+        {
+            labels.Add("Review started");
+        }
+
+        return labels;
+    }
+
+    private static string ReviewSignal(PullRequestSummary pullRequest, string bucketLabel) =>
+        bucketLabel switch
+        {
+            RegressionBucketLabel => "Regression",
+            ApprovedButAgingBucketLabel => "Approved",
+            "CI failing" => pullRequest.Checks.FailureCount > 0 ? $"{pullRequest.Checks.FailureCount} failing check{(pullRequest.Checks.FailureCount == 1 ? "" : "s")}" : "CI failing",
+            "Unresolved feedback" => $"{pullRequest.Review.UnresolvedThreadCount} unresolved thread{(pullRequest.Review.UnresolvedThreadCount == 1 ? "" : "s")}",
+            "Ready to merge" => $"{pullRequest.Review.ApprovalCount} approval{(pullRequest.Review.ApprovalCount == 1 ? "" : "s")}",
+            "Re-review needed" => "Pushed after review",
+            "Quick wins" => $"{pullRequest.ChangedFiles} file{(pullRequest.ChangedFiles == 1 ? "" : "s")}",
+            "Needs review" => "No reviews",
+            "Stalled" => "Idle",
+            "Author response" => "Changes requested",
+            _ => bucketLabel
+        };
+
+    private static bool IsPullRequestWithinFocusAgeLimit(PullRequestSummary pullRequest, string bucketLabel, DateTimeOffset now) =>
+        now - PullRequestFocusActivityAt(pullRequest, bucketLabel) <= s_focusAgeLimit;
+
+    private static DateTimeOffset PullRequestFocusActivityAt(PullRequestSummary pullRequest, string bucketLabel) =>
+        bucketLabel switch
+        {
+            ApprovedButAgingBucketLabel or "Ready to merge" => ReviewActivityAt(pullRequest),
+            "Re-review needed" => pullRequest.LastCommitAt ?? DateTimeOffset.MinValue,
+            "Author response" or "Review started" => pullRequest.Review.LastReviewedAt ?? pullRequest.UpdatedAt,
+            "CI failing" => pullRequest.Checks.CompletedAt ?? pullRequest.UpdatedAt,
+            _ => pullRequest.UpdatedAt
+        };
+
+    private static bool IsWaitingOnAuthor(IReadOnlyCollection<string> bucketLabels) =>
+        bucketLabels.Contains("Author response") && !bucketLabels.Contains("Re-review needed");
+
+    private static int FocusBucketRank(string label) =>
+        s_focusBucketRanks.TryGetValue(label, out var rank) ? rank : int.MaxValue;
+
+    private static int ListBucketRank(string label) =>
+        s_listBucketRanks.TryGetValue(label, out var rank) ? rank : int.MaxValue;
+
+    private static string Key(AgentReviewQueueCandidate candidate) =>
+        $"{candidate.Repository.ToLowerInvariant()}#{candidate.PullRequest.Number}";
+
+    private static bool HasNeedsAuthorActionLabel(PullRequestSummary pullRequest, DashboardOptions options) =>
+        pullRequest.Labels.Any(label => options.DoNotMergeLabels.Contains(label, StringComparer.OrdinalIgnoreCase));
+
+    private static bool HasRegressionSignal(PullRequestSummary pullRequest) =>
+        pullRequest.Labels.Any(HasRegressionLabel)
+        || pullRequest.LinkedIssues.Any(issue => issue.Labels.Any(HasRegressionLabel));
+
+    private static bool HasRegressionLabel(string label) =>
+        label.Contains("regression", StringComparison.OrdinalIgnoreCase);
+
+    private static bool HasMergeConflicts(PullRequestSummary pullRequest) =>
+        pullRequest.MergeableState?.Equals("dirty", StringComparison.OrdinalIgnoreCase) == true;
+
+    private static bool IsApprovedButAging(PullRequestSummary pullRequest, DateTimeOffset now) =>
+        pullRequest.Review.State.Equals("approved", StringComparison.OrdinalIgnoreCase)
+        && ApprovalAgeAt(pullRequest) is { } approvedAt
+        && now - approvedAt >= s_approvedAging;
+
+    private static DateTimeOffset? ApprovalAgeAt(PullRequestSummary pullRequest) =>
+        pullRequest.Review.LastApprovedAt ?? pullRequest.Review.LastReviewedAt;
+
+    private static DateTimeOffset ReviewActivityAt(PullRequestSummary pullRequest)
+    {
+        if (pullRequest.Review.LastApprovedAt is { } approvedAt
+            && pullRequest.Review.LastReviewedAt is { } reviewedAt)
+        {
+            return approvedAt > reviewedAt ? approvedAt : reviewedAt;
+        }
+
+        return pullRequest.Review.LastApprovedAt ?? pullRequest.Review.LastReviewedAt ?? pullRequest.UpdatedAt;
+    }
+
+    private static bool NeedsReReview(PullRequestSummary pullRequest) =>
+        pullRequest.Review.LastReviewedAt is { } lastReviewedAt
+        && pullRequest.LastCommitAt is { } lastCommitAt
+        && (pullRequest.Review.State.Equals("reviewed", StringComparison.OrdinalIgnoreCase)
+            || pullRequest.Review.State.Equals("changes_requested", StringComparison.OrdinalIgnoreCase))
+        && lastCommitAt > lastReviewedAt;
+
+    private static bool IsChecksFailing(AgentReviewQueueCandidate candidate, DashboardOptions options) =>
+        candidate.PullRequest.Checks.State.Equals("failure", StringComparison.OrdinalIgnoreCase)
+        && !IsNonBlockingAggregateFailure(candidate, options)
+        && !NonBlockingOnlyFailureRule(candidate, options);
+
+    private static bool IsChecksPending(AgentReviewQueueCandidate candidate, DashboardOptions options)
+    {
+        if (IsNonBlockingAggregateFailure(candidate, options))
+        {
+            return true;
+        }
+
+        if (NonBlockingOnlyFailureRule(candidate, options))
+        {
+            return candidate.PullRequest.Checks.PendingCount > 0;
+        }
+
+        return candidate.PullRequest.Checks.State.Equals("pending", StringComparison.OrdinalIgnoreCase)
+            || candidate.PullRequest.Checks.State.Equals("unknown", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool NonBlockingOnlyFailureRule(AgentReviewQueueCandidate candidate, DashboardOptions options)
+    {
+        var pullRequest = candidate.PullRequest;
+        if (!pullRequest.Checks.State.Equals("failure", StringComparison.OrdinalIgnoreCase)
+            || pullRequest.Checks.FailureCount != pullRequest.Checks.FailingChecks.Count
+            || pullRequest.Checks.FailingChecks.Count == 0)
+        {
+            return false;
+        }
+
+        var matchingRules = pullRequest.Checks.FailingChecks.Select(check =>
+            options.NonBlockingCheckFailureRules.FirstOrDefault(rule =>
+                candidate.Repository.Equals(rule.Repository, StringComparison.OrdinalIgnoreCase)
+                && MatchesNonBlockingCheckFailureName(rule, check.Name)));
+        return matchingRules.All(rule => rule is not null);
+    }
+
+    private static bool MatchesNonBlockingCheckFailureName(DashboardCheckFailureRuleOptions rule, string name)
+    {
+        var normalizedName = name.Trim();
+        return rule.CheckNames.Contains(normalizedName, StringComparer.OrdinalIgnoreCase)
+            || rule.CheckNameContains.Any(fragment => normalizedName.Contains(fragment, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsNonBlockingAggregateFailure(AgentReviewQueueCandidate candidate, DashboardOptions options)
+    {
+        var checks = candidate.PullRequest.Checks;
+        return checks.State.Equals("failure", StringComparison.OrdinalIgnoreCase)
+            && options.NonBlockingCheckFailureRules.Any(rule => candidate.Repository.Equals(rule.Repository, StringComparison.OrdinalIgnoreCase))
+            && checks.TotalCount == 0
+            && checks.FailureCount == 0
+            && checks.FailingChecks.Count == 0;
+    }
+
+    private static bool IsGeneratedDocsPullRequest(AgentReviewQueueCandidate candidate, DashboardOptions options) =>
+        !string.IsNullOrWhiteSpace(options.DocsFromCode.Repository)
+        && !string.IsNullOrWhiteSpace(options.DocsFromCode.Label)
+        && candidate.Repository.Equals(options.DocsFromCode.Repository, StringComparison.OrdinalIgnoreCase)
+        && candidate.PullRequest.Labels.Contains(options.DocsFromCode.Label, StringComparer.OrdinalIgnoreCase);
+
+    private static bool IsConfiguredCommunityRepository(string repository, DashboardOptions options) =>
+        options.CommunityRepositories.Contains(repository, StringComparer.OrdinalIgnoreCase);
+
+    private static bool IsCommunityPullRequest(AgentReviewQueueCandidate candidate, DashboardOptions options, DateTimeOffset now) =>
+        IsCommunityAuthor(candidate.PullRequest.Author, options)
+        && !IsConfiguredCommunityRepository(candidate.Repository, options);
+
+    private static bool IsAgedOutCommunityPullRequest(AgentReviewQueueCandidate candidate, DashboardOptions options, DateTimeOffset now) =>
+        IsCommunityPullRequest(candidate, options, now)
+        && now - candidate.PullRequest.UpdatedAt > s_focusAgeLimit;
+
+    private static bool IsQuickWin(AgentReviewQueueCandidate candidate, DashboardOptions options, DateTimeOffset now) =>
+        candidate.PullRequest.Review.State.Equals("waiting", StringComparison.OrdinalIgnoreCase)
+        && candidate.PullRequest.Review.UnresolvedThreadCount == 0
+        && !HasMergeConflicts(candidate.PullRequest)
+        && IsCoreTeamAuthor(candidate.PullRequest.Author, options)
+        && !TargetsCurrentRelease(candidate.PullRequest, options)
+        && candidate.PullRequest.LinkedIssues.Count <= 1
+        && candidate.PullRequest.CommitCount <= 2
+        && candidate.PullRequest.ChangedFiles is > 0 and <= QuickWinFileThreshold
+        && ChangedLineCount(candidate.PullRequest) is > 0 and <= QuickWinLineThreshold
+        && !IsIdle(candidate.PullRequest, now);
+
+    private static bool NeedsReview(AgentReviewQueueCandidate candidate, DashboardOptions options) =>
+        candidate.PullRequest.Review.State.Equals("waiting", StringComparison.OrdinalIgnoreCase)
+        && candidate.PullRequest.Review.UnresolvedThreadCount == 0
+        && !HasMergeConflicts(candidate.PullRequest)
+        && IsCoreTeamAuthor(candidate.PullRequest.Author, options);
+
+    private static bool IsIdle(PullRequestSummary pullRequest, DateTimeOffset now) =>
+        now - pullRequest.UpdatedAt >= s_stalledPullRequest;
+
+    private static int ChangedLineCount(PullRequestSummary pullRequest) =>
+        pullRequest.Additions + pullRequest.Deletions;
+
+    private static bool TargetsCurrentRelease(PullRequestSummary pullRequest, DashboardOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.CurrentRelease))
+        {
+            return false;
+        }
+
+        return ReleaseSignalMatches(pullRequest.Title, options.CurrentRelease)
+            || ReleaseSignalMatches(pullRequest.Milestone, options.CurrentRelease)
+            || pullRequest.Labels.Any(label => ReleaseSignalMatches(label, options.CurrentRelease))
+            || pullRequest.LinkedIssues.Any(issue =>
+                ReleaseSignalMatches(issue.Title, options.CurrentRelease)
+                || ReleaseSignalMatches(issue.Milestone, options.CurrentRelease)
+                || issue.Labels.Any(label => ReleaseSignalMatches(label, options.CurrentRelease)));
+    }
+
+    private static bool ReleaseSignalMatches(string? value, string release) =>
+        !string.IsNullOrWhiteSpace(value)
+        && System.Text.RegularExpressions.Regex.IsMatch(
+            value,
+            $"(^|[^0-9]){System.Text.RegularExpressions.Regex.Escape(release)}([^0-9]|$)",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private static bool IsCommunityAuthor(string author, DashboardOptions options) =>
+        !IsBotAuthor(author, options) && !IsCoreTeamAuthor(author, options);
+
+    private static bool IsBotAuthor(string author, DashboardOptions options) =>
+        options.BotAuthors.Contains(author, StringComparer.OrdinalIgnoreCase);
+
+    private static bool IsCoreTeamAuthor(string author, DashboardOptions options) =>
+        MatchingCoreTeamMember(author, options) is not null;
+
+    private static string? MatchingCoreTeamMember(string author, DashboardOptions options)
+    {
+        var authorKey = ActorIdentityKey(author);
+        var matchingMember = options.CoreTeamMembers.FirstOrDefault(member => ActorIdentityKey(member) == authorKey);
+        if (matchingMember is not null)
+        {
+            return matchingMember;
+        }
+
+        var aliasBase = ConfiguredTeamAliasBase(author, options);
+        if (aliasBase is null)
+        {
+            return null;
+        }
+
+        var aliasBaseKey = ActorIdentityKey(aliasBase);
+        return options.CoreTeamMembers.FirstOrDefault(member => ActorIdentityKey(member) == aliasBaseKey) ?? author;
+    }
+
+    private static string? ConfiguredTeamAliasBase(string author, DashboardOptions options)
+    {
+        var suffix = options.CoreTeamMemberAliasSuffixes.FirstOrDefault(candidate =>
+            !string.IsNullOrWhiteSpace(candidate)
+            && author.EndsWith(candidate, StringComparison.OrdinalIgnoreCase)
+            && author.Length > candidate.Length);
+
+        return suffix is null ? null : author[..^suffix.Length];
+    }
+
+    private static string ActorIdentityKey(string actor)
+    {
+        var normalized = actor.ToLowerInvariant();
+        var human = normalized.EndsWith("/copilot", StringComparison.Ordinal)
+            ? normalized[..^"/copilot".Length]
+            : normalized;
+        return string.Concat(human.Where(char.IsAsciiLetterOrDigit));
+    }
+
+    private sealed class AgentReviewQueueItemComparer(DateTimeOffset now) : IComparer<AgentReviewQueueItem>
+    {
+        public static AgentReviewQueueItemComparer Create(DateTimeOffset now) => new(now);
+
+        public int Compare(AgentReviewQueueItem? first, AgentReviewQueueItem? second)
+        {
+            if (ReferenceEquals(first, second))
+            {
+                return 0;
+            }
+
+            if (first is null)
+            {
+                return -1;
+            }
+
+            if (second is null)
+            {
+                return 1;
+            }
+
+            return CompareSameBucketWait(first, second)
+                ?? CompareBy((IsRecentlyUpdated(second.PullRequest) ? 1 : 0) - (IsRecentlyUpdated(first.PullRequest) ? 1 : 0))
+                ?? CompareBy(ListBucketRank(first.BucketLabel).CompareTo(ListBucketRank(second.BucketLabel)))
+                ?? CompareBy(first.PullRequest.CreatedAt.CompareTo(second.PullRequest.CreatedAt))
+                ?? CompareBy(string.Compare(first.Repository, second.Repository, StringComparison.Ordinal))
+                ?? first.PullRequest.Number.CompareTo(second.PullRequest.Number);
+        }
+
+        private static int? CompareBy(int value) => value == 0 ? null : value;
+
+        private int? CompareSameBucketWait(AgentReviewQueueItem first, AgentReviewQueueItem second)
+        {
+            if (!first.BucketLabel.Equals(second.BucketLabel, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            var wait = BucketWaitTime(first.PullRequest, first.BucketLabel).CompareTo(BucketWaitTime(second.PullRequest, second.BucketLabel));
+            if (wait != 0)
+            {
+                return wait;
+            }
+
+            var quickWin = QuickWinScore(first.PullRequest, first.BucketLabel).CompareTo(QuickWinScore(second.PullRequest, second.BucketLabel));
+            return quickWin == 0 ? null : quickWin;
+        }
+
+        private bool IsRecentlyUpdated(PullRequestSummary pullRequest) =>
+            now - pullRequest.UpdatedAt <= s_recentlyUpdatedWindow;
+
+        private static DateTimeOffset BucketWaitTime(PullRequestSummary pullRequest, string bucketLabel) =>
+            bucketLabel switch
+            {
+                ApprovedButAgingBucketLabel or "Ready to merge" => ApprovalAgeAt(pullRequest) ?? DateTimeOffset.MaxValue,
+                "Re-review needed" => pullRequest.LastCommitAt ?? DateTimeOffset.MaxValue,
+                "Author response" or "Review started" => pullRequest.Review.LastReviewedAt ?? pullRequest.UpdatedAt,
+                _ => pullRequest.UpdatedAt
+            };
+
+        private static int QuickWinScore(PullRequestSummary pullRequest, string bucketLabel) =>
+            bucketLabel == "Quick wins"
+                ? pullRequest.Additions + pullRequest.Deletions + (pullRequest.ChangedFiles * 10) + (pullRequest.CommitCount * 5)
+                : 0;
+    }
+}
+
+record AgentReviewQueueResponse(
+    IReadOnlyList<AgentReviewQueueItem> Items,
+    IReadOnlyList<AgentReviewQueueRepositoryResult> Repositories,
+    int TotalCount,
+    DateTimeOffset GeneratedAt);
+
+record AgentReviewQueue(
+    IReadOnlyList<AgentReviewQueueItem> Items,
+    int TotalCount);
+
+record AgentReviewQueueItem(
+    string Repository,
+    PullRequestSummary PullRequest,
+    string BucketLabel,
+    string Reason);
+
+record AgentReviewQueueRepositoryResult(
+    string Repository,
+    int PullRequestCount,
+    PullRequestListSnapshot? Snapshot,
+    string? Error);
+
+readonly record struct AgentReviewQueueCandidate(string Repository, PullRequestSummary PullRequest);

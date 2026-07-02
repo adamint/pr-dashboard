@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
 import type {
   AttentionBucket,
+  AgentReviewQueueItem,
   DeveloperPullRequestCount,
   PickItem,
   PullRequestSummary,
@@ -23,6 +24,7 @@ type QueueOverviewProps = {
   counts: DeveloperPullRequestCount[];
   pullRequests: PullRequestSummary[];
   attentionBuckets: AttentionBucket[];
+  agentReviewQueueItems: AgentReviewQueueItem[] | null;
   forMeItems: PickItem[];
   loading: boolean;
   hasLoaded: boolean;
@@ -37,11 +39,26 @@ const pullRequestListLimit = 10;
 const queueOverviewHelp = 'Needs attention is the focused core-team action queue: each PR appears once under its highest-priority actionable review or merge lane when that lane has fresh activity. Activity is lane-specific, such as the latest approval/review for merge lanes, the newest commit for re-review, or the PR update time for review-needed work. Recent community PRs have their own queue below, and PRs with failing CI are excluded until their checks are green again.';
 const needsAttentionHelp = 'Being in Needs attention means the PR has an actionable reason for someone to review or merge, and that reason was refreshed in the last 14 days. PRs with failing CI are excluded until their checks pass, and standalone signal lanes like stalled, docs, automation, aged-out community, drafts, merge conflicts, unresolved feedback, and author response stay out of this top queue.';
 const communityQueueHelp = 'Community PRs show recently active external-contributor PRs separately from the core-team Needs attention queue. Community PRs with no activity in the last 14 days move to the Aged out community bucket on the signal board.';
+const queueBucketTones = new Map<string, AttentionBucket['tone']>([
+  ['Regression', 'danger'],
+  ['Approved but aging', 'danger'],
+  ['Re-review needed', 'warning'],
+  ['Ready to merge', 'success'],
+  ['Author response', 'danger'],
+  ['Needs review', 'warning'],
+  ['Quick wins', 'success'],
+  ['Review started', 'accent'],
+]);
+
+function queueBucketTone(label: string): AttentionBucket['tone'] {
+  return queueBucketTones.get(label) ?? 'accent';
+}
 
 function QueueOverview({
   counts,
   pullRequests,
   attentionBuckets,
+  agentReviewQueueItems,
   forMeItems,
   loading,
   hasLoaded,
@@ -55,8 +72,15 @@ function QueueOverview({
   const [showFilterInfo, setShowFilterInfo] = useState(false);
 
   const focusItems = useMemo<FocusItem[]>(
-    () => computeFocusItems(attentionBuckets),
-    [attentionBuckets],
+    () => agentReviewQueueItems !== null
+      ? agentReviewQueueItems.map((item) => ({
+        pullRequest: item.pullRequest,
+        reason: item.reason,
+        bucketLabel: item.bucketLabel,
+        bucketTone: queueBucketTone(item.bucketLabel),
+      }))
+      : computeFocusItems(attentionBuckets),
+    [agentReviewQueueItems, attentionBuckets],
   );
   const focusExclusionItems = useMemo<FocusExclusionItem[]>(
     () => computeFocusExclusionItems(pullRequests, attentionBuckets, focusItems, login),

@@ -100,6 +100,49 @@ public sealed class GitHubApiSmokeTests(ServerSmokeFixture fixture) : IClassFixt
     }
 
     [Fact]
+    public async Task AgentSchemaDescribesHomepageFocusQueue()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var client = await GetClientAsync(cancellationToken);
+        using var response = await client.GetAsync("/api/agents/schema", cancellationToken);
+
+        response.EnsureSuccessStatusCode();
+        var schema = await response.Content.ReadFromJsonAsync<AgentSchemaSmokeResponse>(cancellationToken);
+
+        Assert.NotNull(schema);
+        var reviewMode = Assert.Single(schema.Modes, mode => mode.Id == "review");
+        Assert.NotNull(reviewMode.HomepageFocusQueue);
+        Assert.Equal("/api/dashboard/config", reviewMode.HomepageFocusQueue.ConfigEndpoint);
+        Assert.Contains("same focus queue shown on /?mode=review", reviewMode.HomepageFocusQueue.Description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(reviewMode.ApiEndpoints, endpoint =>
+            endpoint.Path.Contains("/api/github/pulls/graphql", StringComparison.Ordinal)
+            && endpoint.Description.Contains("same endpoint the homepage uses", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(reviewMode.ApiEndpoints, endpoint =>
+            endpoint.Path.Contains("/api/agents/review-queue", StringComparison.Ordinal)
+            && endpoint.Description.Contains("programmatic", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("Regression", reviewMode.HomepageFocusQueue.BucketPriority);
+        Assert.Contains("Ready to merge", reviewMode.HomepageFocusQueue.BucketPriority);
+        Assert.Contains("Needs review", reviewMode.HomepageFocusQueue.BucketPriority);
+        Assert.Contains("CI failing", reviewMode.HomepageFocusQueue.ExcludedBuckets);
+        Assert.Contains("Merge conflicts", reviewMode.HomepageFocusQueue.ExcludedBuckets);
+        Assert.Contains("Unresolved feedback", reviewMode.HomepageFocusQueue.ExcludedBuckets);
+        Assert.Contains("Use repositories from dashboard config", reviewMode.HomepageFocusQueue.Steps[0], StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task AgentReviewQueueRejectsInvalidRepositoryWithoutCallingGitHub()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var client = await GetClientAsync(cancellationToken);
+        using var response = await client.GetAsync("/api/agents/review-queue?repo=not-a-repo", cancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<ValidationProblemSmokeResponse>(cancellationToken);
+        Assert.NotNull(problem);
+        Assert.Contains("repo", problem.Errors.Keys);
+    }
+
+    [Fact]
     public async Task AgentSchemaIsMachineDiscoverable()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -190,9 +233,17 @@ public sealed class GitHubApiSmokeTests(ServerSmokeFixture fixture) : IClassFixt
         string Id,
         string DashboardUrl,
         IReadOnlyList<string> UseCases,
-        IReadOnlyList<AgentApiEndpointSchemaSmokeResponse> ApiEndpoints);
+        IReadOnlyList<AgentApiEndpointSchemaSmokeResponse> ApiEndpoints,
+        AgentHomepageFocusQueueSmokeResponse? HomepageFocusQueue);
 
     private sealed record AgentApiEndpointSchemaSmokeResponse(string Path, string Description);
+
+    private sealed record AgentHomepageFocusQueueSmokeResponse(
+        string Description,
+        string ConfigEndpoint,
+        IReadOnlyList<string> Steps,
+        IReadOnlyList<string> BucketPriority,
+        IReadOnlyList<string> ExcludedBuckets);
 
     private sealed record AgentDiscoverySchemaSmokeResponse(IReadOnlyList<string> SchemaUrls);
 
