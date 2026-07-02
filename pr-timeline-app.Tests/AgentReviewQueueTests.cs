@@ -1,0 +1,281 @@
+namespace pr_timeline_app.Tests;
+
+public sealed class AgentReviewQueueTests
+{
+    private static readonly DateTimeOffset s_now = new(2026, 07, 02, 02, 30, 00, TimeSpan.Zero);
+
+    [Fact]
+    public void BuildFocusQueueMatchesHomepagePriorityAndExclusions()
+    {
+        var options = new DashboardOptions
+        {
+            CoreTeamMembers = ["alice", "bob"],
+            DoNotMergeLabels = ["needs-author-action"],
+            BotAuthors = ["github-actions"],
+            CommunityRepositories = ["CommunityToolkit/Aspire"]
+        };
+        var pullRequests = new[]
+        {
+            Pr(1, "Recent review needed", "alice", updatedAt: s_now.AddHours(-1)),
+            Pr(2, "Ready to merge", "bob", updatedAt: s_now.AddHours(-2)) with
+            {
+                Review = Approved(s_now.AddHours(-2)),
+                MergeableState = "clean"
+            },
+            Pr(3, "Re-review needed", "alice", updatedAt: s_now.AddHours(-3)) with
+            {
+                LastCommitAt = s_now.AddHours(-1),
+                Review = Reviewed(s_now.AddHours(-2))
+            },
+            Pr(4, "CI failing", "alice", updatedAt: s_now.AddMinutes(-30)) with
+            {
+                Checks = Failing()
+            },
+            Pr(5, "Community", "external-user", updatedAt: s_now.AddMinutes(-10)),
+            Pr(6, "Held", "alice", updatedAt: s_now.AddMinutes(-5), labels: ["needs-author-action"])
+        };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [new PullRequestListResponse("microsoft/aspire", pullRequests)],
+            options,
+            s_now);
+
+        Assert.Equal([3, 2, 1], queue.Items.Select(item => item.PullRequest.Number));
+        Assert.Equal(["Re-review needed", "Ready to merge", "Needs review"], queue.Items.Select(item => item.BucketLabel));
+        Assert.DoesNotContain(queue.Items, item => item.PullRequest.Number is 4 or 5 or 6);
+    }
+
+    [Fact]
+    public void BuildFocusQueueOrdersSameBucketByOldestWaitLikeHomepage()
+    {
+        var options = new DashboardOptions { CoreTeamMembers = ["alice"] };
+        var pullRequests = new[]
+        {
+            Pr(10, "Newer waiting PR", "alice", createdAt: s_now.AddDays(-1), updatedAt: s_now.AddHours(-1)),
+            Pr(11, "Older waiting PR", "alice", createdAt: s_now.AddDays(-3), updatedAt: s_now.AddHours(-2))
+        };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [new PullRequestListResponse("microsoft/aspire", pullRequests)],
+            options,
+            s_now);
+
+        Assert.Equal([11, 10], queue.Items.Select(item => item.PullRequest.Number));
+    }
+
+    [Fact]
+    public void BuildFocusQueueTreatsHumanCopilotAuthorAsCoreTeam()
+    {
+        var options = new DashboardOptions { CoreTeamMembers = ["JamesNK"] };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [new PullRequestListResponse("microsoft/aspire", [Pr(12, "Copilot PR", "JamesNK/copilot")])],
+            options,
+            s_now);
+
+        var item = Assert.Single(queue.Items);
+        Assert.Equal(12, item.PullRequest.Number);
+        Assert.Equal("Needs review", item.BucketLabel);
+    }
+
+    [Fact]
+    public void BuildFocusQueueTreatsConfiguredTeamAliasAsCoreTeam()
+    {
+        var options = new DashboardOptions { CoreTeamMemberAliasSuffixes = ["_microsoft"] };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [new PullRequestListResponse("microsoft/aspire", [Pr(16, "Alias author PR", "teammate_microsoft")])],
+            options,
+            s_now);
+
+        var item = Assert.Single(queue.Items);
+        Assert.Equal(16, item.PullRequest.Number);
+        Assert.Equal("Needs review", item.BucketLabel);
+    }
+
+    [Fact]
+    public void BuildFocusQueueAllowsConfiguredNonBlockingCheckFailuresWithoutLabel()
+    {
+        var options = new DashboardOptions
+        {
+            CoreTeamMembers = ["alice"],
+            NonBlockingCheckFailureRules =
+            [
+                new DashboardCheckFailureRuleOptions
+                {
+                    Repository = "microsoft/aspire",
+                    CheckNames = ["GitOps/GitHubPop"]
+                }
+            ]
+        };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [
+                new PullRequestListResponse("microsoft/aspire",
+                [
+                    Pr(13, "Non-blocking CI", "alice") with
+                    {
+                        Checks = Failing("GitOps/GitHubPop")
+                    }
+                ])
+            ],
+            options,
+            s_now);
+
+        var item = Assert.Single(queue.Items);
+        Assert.Equal(13, item.PullRequest.Number);
+        Assert.Equal("Needs review", item.BucketLabel);
+    }
+
+    [Fact]
+    public void BuildFocusQueueAllowsConfiguredNonBlockingAggregateFailurePlaceholder()
+    {
+        var options = new DashboardOptions
+        {
+            CoreTeamMembers = ["alice"],
+            NonBlockingCheckFailureRules =
+            [
+                new DashboardCheckFailureRuleOptions
+                {
+                    Repository = "microsoft/aspire",
+                    CheckNames = ["GitOps/GitHubPop"]
+                }
+            ]
+        };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [
+                new PullRequestListResponse("microsoft/aspire",
+                [
+                    Pr(17, "Aggregate placeholder CI", "alice") with
+                    {
+                        Checks = ChecksStatus.Unknown with
+                        {
+                            State = "failure",
+                            TotalCount = 0,
+                            FailureCount = 0,
+                            FailingChecks = []
+                        }
+                    }
+                ])
+            ],
+            options,
+            s_now);
+
+        var item = Assert.Single(queue.Items);
+        Assert.Equal(17, item.PullRequest.Number);
+        Assert.Equal("Needs review", item.BucketLabel);
+    }
+
+    [Fact]
+    public void BuildFocusQueueExcludesCurrentReleaseQuickWins()
+    {
+        var options = new DashboardOptions
+        {
+            CoreTeamMembers = ["alice"],
+            CurrentRelease = "13.4"
+        };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [new PullRequestListResponse("microsoft/aspire", [Pr(14, "Fix release 13.4 notes", "alice")])],
+            options,
+            s_now);
+
+        var item = Assert.Single(queue.Items);
+        Assert.Equal(14, item.PullRequest.Number);
+        Assert.Equal("Needs review", item.BucketLabel);
+    }
+
+    [Fact]
+    public void BuildFocusQueueUsesLatestReviewActivityForApprovedFocusAge()
+    {
+        var options = new DashboardOptions { CoreTeamMembers = ["alice"] };
+        var queue = AgentReviewQueueBuilder.Build(
+            [
+                new PullRequestListResponse("microsoft/aspire",
+                [
+                    Pr(15, "Approved with recent review activity", "alice", updatedAt: s_now.AddDays(-20)) with
+                    {
+                        Review = Approved(s_now.AddDays(-20)) with
+                        {
+                            LastReviewedAt = s_now.AddDays(-1)
+                        },
+                        MergeableState = "clean"
+                    }
+                ])
+            ],
+            options,
+            s_now);
+
+        var item = Assert.Single(queue.Items);
+        Assert.Equal(15, item.PullRequest.Number);
+        Assert.Equal("Approved but aging", item.BucketLabel);
+    }
+
+    private static PullRequestSummary Pr(
+        int number,
+        string title,
+        string author,
+        DateTimeOffset? createdAt = null,
+        DateTimeOffset? updatedAt = null,
+        IReadOnlyList<string>? labels = null) =>
+        new(
+            number,
+            title,
+            "open",
+            false,
+            author,
+            $"https://github.com/microsoft/aspire/pull/{number}",
+            createdAt ?? s_now.AddDays(-1),
+            updatedAt ?? s_now.AddHours(-1),
+            labels ?? [],
+            [],
+            null,
+            [],
+            1,
+            10,
+            5,
+            1,
+            null,
+            $"head-{number}",
+            "main",
+            "clean",
+            ReviewStatus.Waiting,
+            Passing());
+
+    private static ReviewStatus Approved(DateTimeOffset approvedAt) =>
+        new(
+            "approved",
+            "APPROVED",
+            1,
+            1,
+            0,
+            0,
+            approvedAt,
+            approvedAt);
+
+    private static ReviewStatus Reviewed(DateTimeOffset reviewedAt) =>
+        new(
+            "reviewed",
+            "COMMENTED",
+            1,
+            0,
+            0,
+            1,
+            null,
+            reviewedAt);
+
+    private static ChecksStatus Passing() =>
+        ChecksStatus.Unknown with { State = "success", TotalCount = 1, SuccessCount = 1 };
+
+    private static ChecksStatus Failing(params string[] names) =>
+        ChecksStatus.Unknown with
+        {
+            State = "failure",
+            TotalCount = names.Length == 0 ? 1 : names.Length,
+            FailureCount = names.Length == 0 ? 1 : names.Length,
+            FailingChecks = names.Length == 0
+                ? [new FailingCheck("Build", "failure", null)]
+                : names.Select(name => new FailingCheck(name, "failure", null)).ToArray()
+        };
+}
