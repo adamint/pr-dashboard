@@ -5,7 +5,6 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 
 [assembly: CaptureConsole]
@@ -259,7 +258,8 @@ public sealed class ServerSmokeFixture : IAsyncLifetime
             builder.Services.Configure<GitHubReviewPolicyOptions>(
                 builder.Configuration.GetSection(GitHubReviewPolicyOptions.SectionName));
             builder.Services.AddGitHubApiServices(builder.Environment);
-            builder.Services.RemoveAll<IHostedService>();
+            RemoveHostedService<GitHubPublicCacheWarmupService>(builder.Services);
+            RemoveHostedService<NotificationDetectorService>(builder.Services);
 
             app = builder.Build();
 
@@ -293,6 +293,20 @@ public sealed class ServerSmokeFixture : IAsyncLifetime
         {
             await DisposeAppAsync();
             throw;
+        }
+    }
+
+    private static void RemoveHostedService<TService>(IServiceCollection services)
+        where TService : IHostedService
+    {
+        for (var index = services.Count - 1; index >= 0; index--)
+        {
+            var descriptor = services[index];
+            if (descriptor.ServiceType == typeof(IHostedService)
+                && descriptor.ImplementationType == typeof(TService))
+            {
+                services.RemoveAt(index);
+            }
         }
     }
 

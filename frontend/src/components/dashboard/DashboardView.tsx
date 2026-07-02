@@ -265,8 +265,16 @@ function formatLoadDuration(durationMs: number) {
 export default DashboardView;
 
 function getLatestFetchedAt(pullRequests: PullRequestSummary[]) {
-  return pullRequests
-    .map((pullRequest) => pullRequest.fetchedAt)
-    .filter(Boolean)
-    .sort((first, second) => new Date(second).getTime() - new Date(first).getTime())[0] ?? null;
+  let latestTime = Number.NEGATIVE_INFINITY;
+  let latestFetchedAt: string | null = null;
+
+  for (const pullRequest of pullRequests) {
+    const time = Date.parse(pullRequest.fetchedAt);
+    if (Number.isFinite(time) && time > latestTime) {
+      latestTime = time;
+      latestFetchedAt = pullRequest.fetchedAt;
+    }
+  }
+
+  return latestFetchedAt;
 }
