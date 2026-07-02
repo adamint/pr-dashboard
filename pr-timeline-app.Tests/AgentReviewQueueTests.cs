@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace pr_timeline_app.Tests;
 
@@ -82,6 +83,14 @@ public sealed class AgentReviewQueueTests
 
         Assert.Equal(1002, queue.TotalCount);
         Assert.Equal(1000, queue.Items.Count);
+    }
+
+    [Fact]
+    public void ClampLimitBoundsAgentQueueRequests()
+    {
+        Assert.Equal(1, AgentReviewQueueBuilder.ClampLimit(0));
+        Assert.Equal(10, AgentReviewQueueBuilder.ClampLimit(10));
+        Assert.Equal(1000, AgentReviewQueueBuilder.ClampLimit(5000));
     }
 
     [Fact]
@@ -259,6 +268,18 @@ public sealed class AgentReviewQueueTests
 
         var statusResult = Assert.IsAssignableFrom<IStatusCodeHttpResult>(result);
         Assert.Equal(StatusCodes.Status503ServiceUnavailable, statusResult.StatusCode);
+
+        var httpContext = new DefaultHttpContext();
+        httpContext.RequestServices = new ServiceCollection()
+            .AddLogging()
+            .AddProblemDetails()
+            .BuildServiceProvider();
+        httpContext.Response.Body = new MemoryStream();
+        await result.ExecuteAsync(httpContext);
+        httpContext.Response.Body.Position = 0;
+        var body = await new StreamReader(httpContext.Response.Body).ReadToEndAsync(TestContext.Current.CancellationToken);
+        Assert.Contains("No requested repository data was available", body);
+        Assert.DoesNotContain("public cache unavailable", body);
     }
 
     [Fact]

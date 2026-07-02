@@ -22,7 +22,7 @@ static class AgentReviewQueueRoutes
                 repositories,
                 dashboardOptions.Value,
                 refresh == true,
-                limit.GetValueOrDefault(10),
+                AgentReviewQueueBuilder.ClampLimit(limit.GetValueOrDefault(10)),
                 (repository, forceRefresh, token) => pullRequests.GetPullRequestsGraphQlSnapshotAsync(
                     repository,
                     "open",
@@ -67,7 +67,7 @@ static class AgentReviewQueueRoutes
                     repository.ToString(),
                     PullRequestCount: 0,
                     Snapshot: null,
-                    Error: ex.Message));
+                    Error: AgentReviewQueueBuilder.RepositoryUnavailableMessage));
             }
         }
 
@@ -75,7 +75,7 @@ static class AgentReviewQueueRoutes
         {
             return Results.Problem(
                 title: "Agent review queue unavailable",
-                detail: string.Join(" ", repositoryResults.Select(result => $"{result.Repository}: {result.Error}")),
+                detail: "No requested repository data was available for the agent review queue.",
                 statusCode: StatusCodes.Status503ServiceUnavailable);
         }
 
@@ -144,10 +144,11 @@ static class AgentReviewQueueBuilder
     private static readonly TimeSpan s_recentlyUpdatedWindow = TimeSpan.FromDays(2);
     private const int QuickWinLineThreshold = 80;
     private const int QuickWinFileThreshold = 3;
-    private const int MaxQueueLimit = 1000;
     private const string ApprovedButAgingBucketLabel = "Approved but aging";
     private const string RegressionBucketLabel = "Regression";
     private const string AgedOutCommunityBucketLabel = "Aged out community";
+    internal const string RepositoryUnavailableMessage = "Repository data unavailable.";
+    private const int MaxQueueLimit = 1000;
 
     private static readonly HashSet<string> s_excludedFocusBucketLabels = new(StringComparer.Ordinal)
     {
@@ -270,9 +271,11 @@ static class AgentReviewQueueBuilder
             .ToArray();
 
         return new AgentReviewQueue(
-            orderedItems.Take(Math.Clamp(limit, 1, MaxQueueLimit)).ToArray(),
+            orderedItems.Take(ClampLimit(limit)).ToArray(),
             orderedItems.Length);
     }
+
+    internal static int ClampLimit(int limit) => Math.Clamp(limit, 1, MaxQueueLimit);
 
     private static IReadOnlyList<string> ReviewBucketLabels(
         AgentReviewQueueCandidate candidate,
