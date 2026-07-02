@@ -66,6 +66,25 @@ public sealed class AgentReviewQueueTests
     }
 
     [Fact]
+    public void BuildFocusQueueClampsLargeLimits()
+    {
+        var options = new DashboardOptions { CoreTeamMembers = ["alice"] };
+        var pullRequests = Enumerable
+            .Range(1, 1002)
+            .Select(number => Pr(number, $"PR {number}", "alice", createdAt: s_now.AddDays(-number)))
+            .ToArray();
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [new PullRequestListResponse("microsoft/aspire", pullRequests)],
+            options,
+            s_now,
+            limit: 5000);
+
+        Assert.Equal(1002, queue.TotalCount);
+        Assert.Equal(1000, queue.Items.Count);
+    }
+
+    [Fact]
     public void BuildFocusQueueTreatsHumanCopilotAuthorAsCoreTeam()
     {
         var options = new DashboardOptions { CoreTeamMembers = ["JamesNK"] };
@@ -240,6 +259,27 @@ public sealed class AgentReviewQueueTests
 
         var statusResult = Assert.IsAssignableFrom<IStatusCodeHttpResult>(result);
         Assert.Equal(StatusCodes.Status503ServiceUnavailable, statusResult.StatusCode);
+    }
+
+    [Fact]
+    public void TryResolveRepositoriesTrimsDedupesAndIgnoresInvalidConfiguredRepositories()
+    {
+        var resolved = AgentReviewQueueRoutes.TryResolveRepositories(
+            repo: null,
+            configuredRepositories:
+            [
+                " microsoft/aspire ",
+                "microsoft/aspire",
+                "not-a-repo",
+                ""
+            ],
+            out var repositories,
+            out var errors);
+
+        Assert.True(resolved);
+        Assert.Empty(errors);
+        var repository = Assert.Single(repositories);
+        Assert.Equal("microsoft/aspire", repository.ToString());
     }
 
     private static PullRequestSummary Pr(

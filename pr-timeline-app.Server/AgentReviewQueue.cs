@@ -92,25 +92,30 @@ static class AgentReviewQueueRoutes
             now));
     }
 
-    private static bool TryResolveRepositories(
+    internal static bool TryResolveRepositories(
         string? repo,
         IReadOnlyList<string> configuredRepositories,
         out IReadOnlyList<RepositoryName> repositories,
         out Dictionary<string, string[]> errors)
     {
-        var inputs = string.IsNullOrWhiteSpace(repo)
+        var usingConfiguredRepositories = string.IsNullOrWhiteSpace(repo);
+        var inputs = usingConfiguredRepositories
             ? configuredRepositories
-            : repo.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            : (repo ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var parsed = new List<RepositoryName>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var invalid = new List<string>();
 
-        foreach (var input in inputs.Where(input => !string.IsNullOrWhiteSpace(input)))
+        foreach (var input in inputs.Select(input => input.Trim()).Where(input => !string.IsNullOrWhiteSpace(input)))
         {
             if (RepositoryName.TryParse(input, out var repositoryName))
             {
-                parsed.Add(repositoryName);
+                if (seen.Add(repositoryName.ToString()))
+                {
+                    parsed.Add(repositoryName);
+                }
             }
-            else
+            else if (!usingConfiguredRepositories)
             {
                 invalid.Add(input);
             }
@@ -139,6 +144,7 @@ static class AgentReviewQueueBuilder
     private static readonly TimeSpan s_recentlyUpdatedWindow = TimeSpan.FromDays(2);
     private const int QuickWinLineThreshold = 80;
     private const int QuickWinFileThreshold = 3;
+    private const int MaxQueueLimit = 1000;
     private const string ApprovedButAgingBucketLabel = "Approved but aging";
     private const string RegressionBucketLabel = "Regression";
     private const string AgedOutCommunityBucketLabel = "Aged out community";
@@ -264,7 +270,7 @@ static class AgentReviewQueueBuilder
             .ToArray();
 
         return new AgentReviewQueue(
-            orderedItems.Take(Math.Max(1, limit)).ToArray(),
+            orderedItems.Take(Math.Clamp(limit, 1, MaxQueueLimit)).ToArray(),
             orderedItems.Length);
     }
 
