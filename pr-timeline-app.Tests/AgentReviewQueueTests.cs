@@ -73,7 +73,7 @@ public sealed class AgentReviewQueueTests
         var pullRequests = new[]
         {
             Pr(19, "Normal review", "alice", createdAt: s_now.AddDays(-2), updatedAt: s_now.AddHours(-1)),
-            Pr(20, "Regression review", "alice", createdAt: s_now.AddDays(-1), updatedAt: s_now.AddHours(-1), labels: ["regression"])
+            Pr(20, "Regression review", "alice", createdAt: s_now.AddDays(-1), updatedAt: s_now.AddDays(-3), labels: ["regression"])
         };
 
         var queue = AgentReviewQueueBuilder.Build(
@@ -270,8 +270,49 @@ public sealed class AgentReviewQueueTests
         var options = new DashboardOptions { CurrentRelease = " 13.4 " };
 
         Assert.True(AgentReviewQueueBuilder.TargetsCurrentRelease(
-            Pr(18, "Fix 13.4", "alice"),
+            Pr(18, "Fix release-v13.4-notes", "alice"),
             options));
+    }
+
+    [Fact]
+    public async Task BuildReviewQueueResponseLoadsRepositoriesConcurrently()
+    {
+        Assert.True(RepositoryName.TryParse("microsoft/aspire", out var firstRepository));
+        Assert.True(RepositoryName.TryParse("microsoft/extensions", out var secondRepository));
+        var activeLoads = 0;
+        var maxActiveLoads = 0;
+
+        var result = await AgentReviewQueueRoutes.BuildReviewQueueResponseAsync(
+            [firstRepository, secondRepository],
+            new DashboardOptions(),
+            forceRefresh: false,
+            limit: 10,
+            async (repository, _, cancellationToken) =>
+            {
+                var currentActiveLoads = Interlocked.Increment(ref activeLoads);
+                UpdateMaxActiveLoads(currentActiveLoads);
+                await Task.Delay(100, cancellationToken);
+                Interlocked.Decrement(ref activeLoads);
+                return new PullRequestListResponse(repository.ToString(), []);
+            },
+            s_now,
+            TestContext.Current.CancellationToken);
+
+        Assert.IsAssignableFrom<IStatusCodeHttpResult>(result);
+        Assert.True(maxActiveLoads > 1);
+
+        void UpdateMaxActiveLoads(int currentActiveLoads)
+        {
+            int currentMax;
+            do
+            {
+                currentMax = maxActiveLoads;
+                if (currentActiveLoads <= currentMax)
+                {
+                    return;
+                }
+            } while (Interlocked.CompareExchange(ref maxActiveLoads, currentActiveLoads, currentMax) != currentMax);
+        }
     }
 
     [Fact]

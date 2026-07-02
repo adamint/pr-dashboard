@@ -47,14 +47,14 @@ public static class AgentSchemaRoutes
                     [
                         new("GET", "/api/agents/review-queue?repo={owner}/{repo}&refresh=true&limit=10", "Programmatic endpoint for the same most-ready focus queue shown on the homepage review mode. Omit repo to use the dashboard-configured repositories; pass comma-separated repo values to constrain the queue."),
                         new("GET", "/api/dashboard/config", "Return the dashboard configuration used by the homepage. For the homepage review queue, read repositories from repositories or repositoryInput, then use doNotMergeLabels, botAuthors, communityRepositories, coreTeamMembers, and nonBlockingCheckFailureRules when applying queue rules."),
-                        new("GET", "/api/github/pulls/graphql?repo={owner}/{repo}&state=open&refresh=true", "Return pull request summaries from the same endpoint the homepage uses for review mode. Repeat for each configured repository. Set refresh=true to force live GitHub refresh when authenticated; unauthenticated callers may receive a stale/empty shared-cache error until the public cache is warm."),
+                        new("GET", "/api/github/pulls/graphql?repo={owner}/{repo}&state=open&refresh=true", "Return pull request summaries from the same endpoint the homepage uses for review mode. Use this per repository when you need raw pull request data instead of the aggregated review queue. Set refresh=true to force live GitHub refresh when authenticated; unauthenticated callers may receive a stale/empty shared-cache error until the public cache is warm."),
                         new("GET", "/api/github/pulls/stream?repo={owner}/{repo}&state=open&refresh=true", "Stream pull request summaries for one repository. Set refresh=true to force live GitHub refresh when authenticated. Items with isStale=true are cached overlays and should not be treated as final. A stream is complete only after an item with isComplete=true; if the stream ends without isComplete, keep prior/live data marked incomplete."),
                         new("GET", "/api/github/pulls?repo={owner}/{repo}&state=open", "Return pull request summaries for one repository."),
                         new("GET", "/api/github/pulls/{number}/timeline?repo={owner}/{repo}", "Return activity, checks, mergeability, and triage detail for one pull request.")
                     ],
                     RequiredInputs:
                     [
-                        new("repo", "GitHub owner/repo. Repeat the endpoint for each repository when you need a multi-repo queue."),
+                        new("repo", "Optional GitHub owner/repo filter. Omit it to use configured repositories, or pass comma-separated owner/repo values for a multi-repo queue."),
                         new("state", "Optional pull request state: open, closed, or all. Defaults to open.")
                     ],
                     HomepageFocusQueue: new(

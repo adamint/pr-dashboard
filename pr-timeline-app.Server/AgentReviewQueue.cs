@@ -3,6 +3,8 @@ using Microsoft.Extensions.Options;
 
 static class AgentReviewQueueRoutes
 {
+    private const int MaxConcurrentRepositoryLoads = 4;
+
     public static IEndpointRouteBuilder MapAgentReviewQueueRoutes(this IEndpointRouteBuilder endpoints)
     {
         endpoints.MapGet("/api/agents/review-queue", async (
@@ -44,31 +46,22 @@ static class AgentReviewQueueRoutes
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
+        using var repositoryLoadSemaphore = new SemaphoreSlim(MaxConcurrentRepositoryLoads);
+        var repositoryLoadTasks = repositories
+            .Select((repository, index) => LoadRepositoryAsync(index, repository))
+            .ToArray();
+        var repositoryLoadResults = await Task.WhenAll(repositoryLoadTasks);
+
         var responses = new List<PullRequestListResponse>();
         var repositoryResults = new List<AgentReviewQueueRepositoryResult>();
-        foreach (var repository in repositories)
+        foreach (var loadResult in repositoryLoadResults.OrderBy(result => result.Index))
         {
-            try
+            if (loadResult.Response is not null)
             {
-                var response = await loadPullRequests(
-                    repository,
-                    forceRefresh,
-                    cancellationToken);
-                responses.Add(response);
-                repositoryResults.Add(new(
-                    repository.ToString(),
-                    response.PullRequests.Count,
-                    response.Snapshot,
-                    Error: null));
+                responses.Add(loadResult.Response);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
-            {
-                repositoryResults.Add(new(
-                    repository.ToString(),
-                    PullRequestCount: 0,
-                    Snapshot: null,
-                    Error: AgentReviewQueueBuilder.RepositoryUnavailableMessage));
-            }
+
+            repositoryResults.Add(loadResult.Result);
         }
 
         if (responses.Count == 0 && repositoryResults.Count > 0)
@@ -90,6 +83,37 @@ static class AgentReviewQueueRoutes
             repositoryResults,
             queue.TotalCount,
             now));
+
+        async Task<(int Index, PullRequestListResponse? Response, AgentReviewQueueRepositoryResult Result)> LoadRepositoryAsync(
+            int index,
+            RepositoryName repository)
+        {
+            await repositoryLoadSemaphore.WaitAsync(cancellationToken);
+            try
+            {
+                var response = await loadPullRequests(
+                    repository,
+                    forceRefresh,
+                    cancellationToken);
+                return (index, response, new AgentReviewQueueRepositoryResult(
+                    repository.ToString(),
+                    response.PullRequests.Count,
+                    response.Snapshot,
+                    Error: null));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                return (index, null, new AgentReviewQueueRepositoryResult(
+                    repository.ToString(),
+                    PullRequestCount: 0,
+                    Snapshot: null,
+                    Error: AgentReviewQueueBuilder.RepositoryUnavailableMessage));
+            }
+            finally
+            {
+                repositoryLoadSemaphore.Release();
+            }
+        }
     }
 
     internal static bool TryResolveRepositories(
@@ -659,8 +683,8 @@ static class AgentReviewQueueBuilder
             }
 
             return CompareSameBucketWait(first, second)
-                ?? CompareBy((IsRecentlyUpdated(second.PullRequest) ? 1 : 0) - (IsRecentlyUpdated(first.PullRequest) ? 1 : 0))
                 ?? CompareBy(ListBucketRank(first.BucketLabel).CompareTo(ListBucketRank(second.BucketLabel)))
+                ?? CompareBy((IsRecentlyUpdated(second.PullRequest) ? 1 : 0) - (IsRecentlyUpdated(first.PullRequest) ? 1 : 0))
                 ?? CompareBy(first.PullRequest.CreatedAt.CompareTo(second.PullRequest.CreatedAt))
                 ?? CompareBy(string.Compare(first.Repository, second.Repository, StringComparison.Ordinal))
                 ?? first.PullRequest.Number.CompareTo(second.PullRequest.Number);

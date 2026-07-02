@@ -94,8 +94,8 @@ function rowActionSignalProps(entry: PullRequestListEntry): PullRequestListEntry
 
 function comparePullRequestListEntries(first: PullRequestListEntry, second: PullRequestListEntry) {
   return compareSameBucketWait(first, second)
-    || Number(isRecentlyUpdated(second.pullRequest)) - Number(isRecentlyUpdated(first.pullRequest))
     || bucketRank(first.bucketLabel) - bucketRank(second.bucketLabel)
+    || Number(isRecentlyUpdated(second.pullRequest)) - Number(isRecentlyUpdated(first.pullRequest))
     || createdTime(first.pullRequest) - createdTime(second.pullRequest)
     || first.pullRequest.repository.localeCompare(second.pullRequest.repository)
     || first.pullRequest.number - second.pullRequest.number;

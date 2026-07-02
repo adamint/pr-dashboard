@@ -614,9 +614,8 @@ describe('App navigation', () => {
     await unmountApp(root);
   });
 
-  it('ignores older agent queue responses from the same snapshot-polling load', async () => {
+  it('loads the agent queue after same-load snapshot polling settles', async () => {
     window.history.replaceState(null, '', '/');
-    const firstAgentQueueLoaded = createDeferred<void>();
     const staleServerQueueWinner = createPullRequest('success', {
       number: 412,
       title: 'Older same-load queue item',
@@ -631,7 +630,6 @@ describe('App navigation', () => {
       updatedAt: '2026-01-04T00:00:00Z',
     });
     const fetchMock = createSameLoadAgentReviewQueueRaceFetchMock(
-      firstAgentQueueLoaded.promise,
       staleServerQueueWinner,
       freshServerQueueWinner,
     );
@@ -640,10 +638,7 @@ describe('App navigation', () => {
     const { root } = await renderApp();
 
     await waitFor(() => {
-      expect(requestUrls(fetchMock, '/api/agents/review-queue')).toHaveLength(2);
-    });
-    await act(async () => {
-      firstAgentQueueLoaded.resolve();
+      expect(requestUrls(fetchMock, '/api/agents/review-queue')).toHaveLength(1);
     });
 
     await waitFor(() => {
@@ -676,6 +671,7 @@ describe('App navigation', () => {
       expect(document.body.textContent).not.toContain('Live refreshed row');
     });
     expect(pullRequestListUrls(fetchMock).some((url) => url.searchParams.get('refresh') === 'true')).toBe(true);
+    expect(requestUrls(fetchMock, '/api/agents/review-queue')).toHaveLength(1);
 
     await act(async () => {
       liveRefresh.resolve();
@@ -687,6 +683,7 @@ describe('App navigation', () => {
     });
     expect(checksRequestUrls(fetchMock).some((url) => url.searchParams.has('refresh'))).toBe(false);
     expect(requestUrls(fetchMock, '/api/agents/review-queue').some((url) => url.searchParams.has('refresh'))).toBe(false);
+    expect(requestUrls(fetchMock, '/api/agents/review-queue')).toHaveLength(2);
 
     await unmountApp(root);
   });
@@ -1701,12 +1698,11 @@ function createPartialAgentReviewQueueFetchMock(serverQueueWinner: PullRequestSu
 }
 
 function createSameLoadAgentReviewQueueRaceFetchMock(
-  firstAgentQueueLoaded: Promise<void>,
   staleServerQueueWinner: PullRequestSummary,
   freshServerQueueWinner: PullRequestSummary,
 ) {
   let pullListRequestCount = 0;
-  let agentQueueRequestCount = 0;
+  let pullListSettled = false;
 
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = new URL(input.toString(), window.location.origin);
@@ -1732,20 +1728,9 @@ function createSameLoadAgentReviewQueueRaceFetchMock(
     }
 
     if (url.pathname === '/api/agents/review-queue') {
-      agentQueueRequestCount += 1;
-      if (agentQueueRequestCount === 1) {
-        await firstAgentQueueLoaded;
-        return jsonResponse(agentReviewQueue([{
-          repository: staleServerQueueWinner.repository,
-          pullRequest: staleServerQueueWinner,
-          bucketLabel: 'Needs review',
-          reason: 'No reviews',
-        }]));
-      }
-
       return jsonResponse(agentReviewQueue([{
-        repository: freshServerQueueWinner.repository,
-        pullRequest: freshServerQueueWinner,
+        repository: pullListSettled ? freshServerQueueWinner.repository : staleServerQueueWinner.repository,
+        pullRequest: pullListSettled ? freshServerQueueWinner : staleServerQueueWinner,
         bucketLabel: 'Needs review',
         reason: 'No reviews',
       }]));
@@ -1766,6 +1751,7 @@ function createSameLoadAgentReviewQueueRaceFetchMock(
         }));
       }
 
+      pullListSettled = true;
       return jsonResponse(pullRequestList(freshServerQueueWinner.repository, [freshServerQueueWinner]));
     }
 

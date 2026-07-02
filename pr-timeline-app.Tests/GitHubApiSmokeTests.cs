@@ -116,7 +116,8 @@ public sealed class GitHubApiSmokeTests(ServerSmokeFixture fixture) : IClassFixt
         Assert.Contains("same focus queue shown on /?mode=review", reviewMode.HomepageFocusQueue.Description, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(reviewMode.ApiEndpoints, endpoint =>
             endpoint.Path.Contains("/api/github/pulls/graphql", StringComparison.Ordinal)
-            && endpoint.Description.Contains("same endpoint the homepage uses", StringComparison.OrdinalIgnoreCase));
+            && endpoint.Description.Contains("raw pull request data", StringComparison.OrdinalIgnoreCase)
+            && !endpoint.Description.Contains("Repeat for each configured repository", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(reviewMode.ApiEndpoints, endpoint =>
             endpoint.Path.Contains("/api/agents/review-queue", StringComparison.Ordinal)
             && endpoint.Description.Contains("programmatic", StringComparison.OrdinalIgnoreCase));

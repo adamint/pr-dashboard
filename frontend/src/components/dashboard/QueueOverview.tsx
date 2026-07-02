@@ -73,12 +73,7 @@ function QueueOverview({
 
   const focusItems = useMemo<FocusItem[]>(
     () => agentReviewQueueItems !== null
-      ? agentReviewQueueItems.map((item) => ({
-        pullRequest: item.pullRequest,
-        reason: item.reason,
-        bucketLabel: item.bucketLabel,
-        bucketTone: queueBucketTone(item.bucketLabel),
-      }))
+      ? agentReviewQueueItems.map((item) => agentReviewQueueFocusItem(item, attentionBuckets))
       : computeFocusItems(attentionBuckets),
     [agentReviewQueueItems, attentionBuckets],
   );
@@ -220,6 +215,7 @@ function QueueOverview({
               },
             }))}
             limit={pullRequestListLimit}
+            preserveOrder={agentReviewQueueItems !== null}
             emptyState={loading ? 'Loading review queue...' : 'No PRs with recent action-relevant activity need attention in the current results.'}
             onSelectPullRequest={onSelectPullRequest}
             onVisiblePullRequest={onVisiblePullRequest}
@@ -365,6 +361,42 @@ function QueueOverview({
       )}
     </section>
   );
+}
+
+function agentReviewQueueFocusItem(
+  item: AgentReviewQueueItem,
+  attentionBuckets: AttentionBucket[],
+): FocusItem {
+  const clientBucketItem = matchingAttentionBucketItem(item, attentionBuckets);
+  return {
+    pullRequest: item.pullRequest,
+    reason: clientBucketItem?.reason ?? item.reason,
+    bucketLabel: item.bucketLabel,
+    bucketTone: clientBucketItem?.bucket.tone ?? queueBucketTone(item.bucketLabel),
+  };
+}
+
+function matchingAttentionBucketItem(
+  item: AgentReviewQueueItem,
+  attentionBuckets: AttentionBucket[],
+) {
+  const key = pullRequestKey(item.pullRequest);
+  for (const bucket of attentionBuckets) {
+    if (bucket.label !== item.bucketLabel) {
+      continue;
+    }
+
+    const bucketItem = bucket.items.find((candidate) => pullRequestKey(candidate.pullRequest) === key);
+    if (bucketItem) {
+      return { bucket, reason: bucketItem.reason };
+    }
+  }
+
+  return null;
+}
+
+function pullRequestKey(pullRequest: PullRequestSummary) {
+  return `${pullRequest.repository.toLowerCase()}#${pullRequest.number}`;
 }
 
 export default QueueOverview;

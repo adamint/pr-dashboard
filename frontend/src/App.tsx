@@ -658,6 +658,9 @@ function App() {
           applyPullRequestListResults(pullRequestGroups, !shouldPollPullRequestSnapshots(pullRequestGroups));
         }
       }
+      if (isCurrentLoad() && pullState === 'open' && shouldPollPullRequestSnapshots(pullRequestGroups)) {
+        void loadAgentReviewQueue(repositories, abortController.signal);
+      }
     } catch (err) {
       if (!isCurrentLoad() || (err instanceof DOMException && err.name === 'AbortError')) {
         return;
@@ -691,11 +694,13 @@ function App() {
         pullRequestGroups.flatMap((group) => group.pullRequests),
       );
       setPullRequests((currentPullRequests) => replacePullRequestsByUpdatedAt(currentPullRequests, nextPullRequests));
-      if (pullState === 'open') {
+      if (pullState === 'open' && settled) {
         void loadAgentReviewQueue(repositories, abortController.signal);
       } else {
         agentReviewQueueRequestVersionRef.current += 1;
-        setAgentReviewQueueItems(null);
+        if (pullState !== 'open') {
+          setAgentReviewQueueItems(null);
+        }
       }
       setReviewLastUpdatedAt(getPullRequestListLastUpdatedAt(nextPullRequests, pullRequestGroups));
       const snapshotState = getPullRequestSnapshotState(pullRequestGroups);

@@ -27,14 +27,22 @@ describe('PullRequestList ordering', () => {
   });
 
   it('keeps regression rows ahead of lower-priority focus buckets', async () => {
-    const updatedAt = new Date().toISOString();
+    const now = Date.now();
     await renderPullRequestList([
       {
-        pullRequest: pullRequest({ number: 1, title: 'Needs review row', updatedAt }),
+        pullRequest: pullRequest({
+          number: 1,
+          title: 'Needs review row',
+          updatedAt: new Date(now).toISOString(),
+        }),
         bucketLabel: 'Needs review',
       },
       {
-        pullRequest: pullRequest({ number: 2, title: 'Regression row', updatedAt }),
+        pullRequest: pullRequest({
+          number: 2,
+          title: 'Regression row',
+          updatedAt: new Date(now - 3 * 24 * 60 * 60 * 1000).toISOString(),
+        }),
         bucketLabel: 'Regression',
       },
     ]);
@@ -43,7 +51,42 @@ describe('PullRequestList ordering', () => {
     expect(document.body.textContent).not.toContain('Needs review row');
   });
 
-  async function renderPullRequestList(entries: ComponentProps<typeof PullRequestList>['entries']) {
+  it('preserves caller order when server-ranked rows opt out of local sorting', async () => {
+    await renderPullRequestList(
+      [
+        {
+          pullRequest: pullRequest({
+            number: 3,
+            title: 'Server first row',
+            createdAt: '2026-01-02T00:00:00Z',
+            updatedAt: '2026-01-02T00:00:00Z',
+          }),
+          bucketLabel: 'Needs review',
+        },
+        {
+          pullRequest: pullRequest({
+            number: 4,
+            title: 'Locally higher ranked row',
+            createdAt: '2026-01-01T00:00:00Z',
+            updatedAt: '2026-01-05T00:00:00Z',
+          }),
+          bucketLabel: 'Regression',
+        },
+      ],
+      true,
+      2,
+    );
+
+    const titles = [...document.querySelectorAll('.attention-pr-title')]
+      .map((element) => element.textContent);
+    expect(titles).toEqual(['Server first row', 'Locally higher ranked row']);
+  });
+
+  async function renderPullRequestList(
+    entries: ComponentProps<typeof PullRequestList>['entries'],
+    preserveOrder = false,
+    limit: ComponentProps<typeof PullRequestList>['limit'] = 1,
+  ) {
     const host = document.createElement('div');
     document.body.append(host);
     root = createRoot(host);
@@ -51,7 +94,8 @@ describe('PullRequestList ordering', () => {
       root?.render(
         <PullRequestList
           entries={entries}
-          limit={1}
+          limit={limit}
+          preserveOrder={preserveOrder}
           onSelectPullRequest={() => undefined}
         />,
       );
