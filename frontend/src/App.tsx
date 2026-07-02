@@ -692,7 +692,7 @@ function App() {
       );
       setPullRequests((currentPullRequests) => replacePullRequestsByUpdatedAt(currentPullRequests, nextPullRequests));
       if (pullState === 'open') {
-        void loadAgentReviewQueue(repositories, options, abortController.signal);
+        void loadAgentReviewQueue(repositories, abortController.signal);
       } else {
         agentReviewQueueRequestVersionRef.current += 1;
         setAgentReviewQueueItems(null);
@@ -712,13 +712,9 @@ function App() {
 
     async function loadAgentReviewQueue(
       repositories: string[],
-      options: LoadOptions,
       signal: AbortSignal,
     ) {
       const query = new URLSearchParams({ repo: repositories.join(','), limit: '1000' });
-      if (options.forceRefresh) {
-        query.set('refresh', 'true');
-      }
 
       const requestVersion = ++agentReviewQueueRequestVersionRef.current;
       try {

@@ -67,6 +67,28 @@ public sealed class AgentReviewQueueTests
     }
 
     [Fact]
+    public void BuildFocusQueueOrdersRegressionBeforeLowerPriorityBuckets()
+    {
+        var options = new DashboardOptions { CoreTeamMembers = ["alice"] };
+        var pullRequests = new[]
+        {
+            Pr(19, "Normal review", "alice", createdAt: s_now.AddDays(-2), updatedAt: s_now.AddHours(-1)),
+            Pr(20, "Regression review", "alice", createdAt: s_now.AddDays(-1), updatedAt: s_now.AddHours(-1), labels: ["regression"])
+        };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [new PullRequestListResponse("microsoft/aspire", pullRequests)],
+            options,
+            s_now,
+            limit: 1);
+
+        var item = Assert.Single(queue.Items);
+        Assert.Equal(20, item.PullRequest.Number);
+        Assert.Equal("Regression", item.BucketLabel);
+        Assert.Equal(2, queue.TotalCount);
+    }
+
+    [Fact]
     public void BuildFocusQueueClampsLargeLimits()
     {
         var options = new DashboardOptions { CoreTeamMembers = ["alice"] };
@@ -248,7 +270,7 @@ public sealed class AgentReviewQueueTests
         var options = new DashboardOptions { CurrentRelease = " 13.4 " };
 
         Assert.True(AgentReviewQueueBuilder.TargetsCurrentRelease(
-            Pr(18, "Fix release 13.4 notes", "alice"),
+            Pr(18, "Fix 13.4", "alice"),
             options));
     }
 

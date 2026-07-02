@@ -25,6 +25,7 @@ type PullRequestListProps = {
 const recentlyUpdatedWindowMs = 2 * dayMs;
 const approvedButAgingBucketLabel = 'Approved but aging';
 const bucketRanks = new Map([
+  ['Regression', -2],
   ['CI failing', -1],
   [approvedButAgingBucketLabel, 0],
   ['Re-review needed', 1],

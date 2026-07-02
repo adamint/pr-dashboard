@@ -193,6 +193,7 @@ static class AgentReviewQueueBuilder
 
     private static readonly Dictionary<string, int> s_listBucketRanks = new(StringComparer.Ordinal)
     {
+        [RegressionBucketLabel] = -2,
         ["CI failing"] = -1,
         [ApprovedButAgingBucketLabel] = 0,
         ["Re-review needed"] = 1,

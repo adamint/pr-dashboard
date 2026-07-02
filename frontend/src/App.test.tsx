@@ -666,6 +666,7 @@ describe('App navigation', () => {
       expect(document.body.textContent).not.toContain('Cached row');
     });
     expect(checksRequestUrls(fetchMock).some((url) => url.searchParams.has('refresh'))).toBe(false);
+    expect(requestUrls(fetchMock, '/api/agents/review-queue').some((url) => url.searchParams.has('refresh'))).toBe(false);
 
     await unmountApp(root);
   });
