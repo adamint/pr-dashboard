@@ -144,6 +144,20 @@ public sealed class GitHubApiSmokeTests(ServerSmokeFixture fixture) : IClassFixt
     }
 
     [Fact]
+    public async Task AgentReviewQueueRejectsExcessiveExplicitRepositoriesWithoutCallingGitHub()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var client = await GetClientAsync(cancellationToken);
+        var repo = string.Join(",", Enumerable.Range(1, 51).Select(index => $"owner/repo-{index}"));
+        using var response = await client.GetAsync($"/api/agents/review-queue?repo={repo}", cancellationToken);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<ValidationProblemSmokeResponse>(cancellationToken);
+        Assert.NotNull(problem);
+        Assert.Equal("Pass at most 50 repositories in repo=.", Assert.Single(problem.Errors["repo"]));
+    }
+
+    [Fact]
     public async Task AgentSchemaIsMachineDiscoverable()
     {
         var cancellationToken = TestContext.Current.CancellationToken;

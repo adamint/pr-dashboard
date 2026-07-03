@@ -116,6 +116,22 @@ public sealed class AgentReviewQueueTests
     }
 
     [Fact]
+    public void TryResolveRepositoriesRejectsExcessiveExplicitRepositoryLists()
+    {
+        var repo = string.Join(",", Enumerable.Range(1, 51).Select(index => $"owner/repo-{index}"));
+
+        var resolved = AgentReviewQueueRoutes.TryResolveRepositories(
+            repo,
+            configuredRepositories: [],
+            out var repositories,
+            out var errors);
+
+        Assert.False(resolved);
+        Assert.Equal(51, repositories.Count);
+        Assert.Equal("Pass at most 50 repositories in repo=.", Assert.Single(errors["repo"]));
+    }
+
+    [Fact]
     public void BuildFocusQueueTreatsHumanCopilotAuthorAsCoreTeam()
     {
         var options = new DashboardOptions { CoreTeamMembers = ["JamesNK", "abbot"] };
@@ -193,6 +209,11 @@ public sealed class AgentReviewQueueTests
                     Repository = " microsoft/aspire ",
                     Label = "",
                     CheckNames = [" Build "]
+                },
+                new DashboardCheckFailureRuleOptions
+                {
+                    Repository = "microsoft/aspire",
+                    Label = "Known flaky"
                 }
             ]
         };
@@ -205,6 +226,16 @@ public sealed class AgentReviewQueueTests
                     Pr(23, "Incomplete non-blocking rule", "alice") with
                     {
                         Checks = Failing("Build")
+                    },
+                    Pr(26, "Matcherless aggregate placeholder", "alice") with
+                    {
+                        Checks = ChecksStatus.Unknown with
+                        {
+                            State = "failure",
+                            TotalCount = 0,
+                            FailureCount = 0,
+                            FailingChecks = []
+                        }
                     }
                 ])
             ],

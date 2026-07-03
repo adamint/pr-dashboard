@@ -4,6 +4,7 @@ using Microsoft.Extensions.Options;
 static class AgentReviewQueueRoutes
 {
     private const int MaxConcurrentRepositoryLoads = 4;
+    private const int MaxExplicitRepositoryCount = 50;
 
     public static IEndpointRouteBuilder MapAgentReviewQueueRoutes(this IEndpointRouteBuilder endpoints)
     {
@@ -155,6 +156,10 @@ static class AgentReviewQueueRoutes
         else if (parsed.Count == 0)
         {
             errors["repo"] = ["Configure at least one dashboard repository or pass repo=owner/repo."];
+        }
+        else if (!usingConfiguredRepositories && parsed.Count > MaxExplicitRepositoryCount)
+        {
+            errors["repo"] = [$"Pass at most {MaxExplicitRepositoryCount} repositories in repo=."];
         }
 
         return errors.Count == 0;
@@ -341,8 +346,14 @@ static class AgentReviewQueueBuilder
                 CheckNames = NormalizeList(rule.CheckNames),
                 CheckNameContains = NormalizeList(rule.CheckNameContains)
             })
-            .Where(rule => rule.Repository.Length > 0 && rule.Label.Length > 0)
+            .Where(rule =>
+                rule.Repository.Length > 0
+                && rule.Label.Length > 0
+                && HasCheckMatcher(rule))
             .ToArray();
+
+    private static bool HasCheckMatcher(DashboardCheckFailureRuleOptions rule) =>
+        rule.CheckNames.Length > 0 || rule.CheckNameContains.Length > 0;
 
     private static IReadOnlyList<string> ReviewBucketLabels(
         AgentReviewQueueCandidate candidate,
