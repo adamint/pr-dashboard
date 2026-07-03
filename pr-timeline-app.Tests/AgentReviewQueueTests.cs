@@ -118,16 +118,35 @@ public sealed class AgentReviewQueueTests
     [Fact]
     public void BuildFocusQueueTreatsHumanCopilotAuthorAsCoreTeam()
     {
-        var options = new DashboardOptions { CoreTeamMembers = ["JamesNK"] };
+        var options = new DashboardOptions { CoreTeamMembers = ["JamesNK", "abbot"] };
 
         var queue = AgentReviewQueueBuilder.Build(
-            [new PullRequestListResponse("microsoft/aspire", [Pr(12, "Copilot PR", "JamesNK/copilot")])],
+            [
+                new PullRequestListResponse("microsoft/aspire",
+                [
+                    Pr(12, "Copilot PR", "JamesNK/copilot"),
+                    Pr(25, "Copilot PR from bot-named human", "abbot/copilot")
+                ])
+            ],
             options,
             s_now);
 
-        var item = Assert.Single(queue.Items);
-        Assert.Equal(12, item.PullRequest.Number);
-        Assert.Equal("Needs review", item.BucketLabel);
+        Assert.Equal([12, 25], queue.Items.Select(item => item.PullRequest.Number));
+        Assert.All(queue.Items, item => Assert.Equal("Needs review", item.BucketLabel));
+    }
+
+    [Fact]
+    public void BuildFocusQueueRoutesUnconfiguredBotAuthorsToAutomation()
+    {
+        var options = new DashboardOptions { CoreTeamMembers = ["alice"] };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [new PullRequestListResponse("microsoft/aspire", [Pr(21, "Bot PR", "dependabot[bot]")])],
+            options,
+            s_now);
+
+        Assert.Empty(queue.Items);
+        Assert.Equal(0, queue.TotalCount);
     }
 
     [Fact]
@@ -146,7 +165,58 @@ public sealed class AgentReviewQueueTests
     }
 
     [Fact]
-    public void BuildFocusQueueAllowsConfiguredNonBlockingCheckFailuresWithoutLabel()
+    public void BuildFocusQueueTreatsConfiguredTeamAliasCopilotAuthorAsCoreTeam()
+    {
+        var options = new DashboardOptions { CoreTeamMemberAliasSuffixes = ["_microsoft"] };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [new PullRequestListResponse("microsoft/aspire", [Pr(24, "Alias Copilot author PR", "teammate_microsoft/copilot")])],
+            options,
+            s_now);
+
+        var item = Assert.Single(queue.Items);
+        Assert.Equal(24, item.PullRequest.Number);
+        Assert.Equal("Needs review", item.BucketLabel);
+    }
+
+    [Fact]
+    public void BuildFocusQueueNormalizesHoldLabelsAndDropsIncompleteNonBlockingRules()
+    {
+        var options = new DashboardOptions
+        {
+            CoreTeamMembers = ["alice"],
+            DoNotMergeLabels = [" no-merge "],
+            NonBlockingCheckFailureRules =
+            [
+                new DashboardCheckFailureRuleOptions
+                {
+                    Repository = " microsoft/aspire ",
+                    Label = "",
+                    CheckNames = [" Build "]
+                }
+            ]
+        };
+
+        var queue = AgentReviewQueueBuilder.Build(
+            [
+                new PullRequestListResponse("microsoft/aspire",
+                [
+                    Pr(22, "Held by normalized label", "alice", labels: ["no-merge"]),
+                    Pr(23, "Incomplete non-blocking rule", "alice") with
+                    {
+                        Checks = Failing("Build")
+                    }
+                ])
+            ],
+            options,
+            s_now);
+
+        Assert.Empty(queue.Items);
+        Assert.Equal(0, queue.TotalCount);
+    }
+
+    [Fact]
+    public void BuildFocusQueueAllowsConfiguredNonBlockingCheckFailuresWithLabel()
     {
         var options = new DashboardOptions
         {
@@ -156,6 +226,7 @@ public sealed class AgentReviewQueueTests
                 new DashboardCheckFailureRuleOptions
                 {
                     Repository = "microsoft/aspire",
+                    Label = "Known flaky",
                     CheckNames = ["GitOps/GitHubPop"]
                 }
             ]
@@ -190,6 +261,7 @@ public sealed class AgentReviewQueueTests
                 new DashboardCheckFailureRuleOptions
                 {
                     Repository = "microsoft/aspire",
+                    Label = "Known flaky",
                     CheckNames = ["GitOps/GitHubPop"]
                 }
             ]

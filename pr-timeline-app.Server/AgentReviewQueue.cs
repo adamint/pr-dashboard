@@ -15,14 +15,15 @@ static class AgentReviewQueueRoutes
             GitHubPullRequestService pullRequests,
             CancellationToken cancellationToken) =>
         {
-            if (!TryResolveRepositories(repo, dashboardOptions.Value.Repositories, out var repositories, out var errors))
+            var options = AgentReviewQueueBuilder.NormalizeOptions(dashboardOptions.Value);
+            if (!TryResolveRepositories(repo, options.Repositories, out var repositories, out var errors))
             {
                 return Results.ValidationProblem(errors);
             }
 
             return await BuildReviewQueueResponseAsync(
                 repositories,
-                dashboardOptions.Value,
+                options,
                 refresh == true,
                 AgentReviewQueueBuilder.ClampLimit(limit.GetValueOrDefault(10)),
                 (repository, forceRefresh, token) => pullRequests.GetPullRequestsGraphQlSnapshotAsync(
@@ -237,6 +238,7 @@ static class AgentReviewQueueBuilder
         var candidates = responses
             .SelectMany(response => response.PullRequests.Select(pullRequest => new AgentReviewQueueCandidate(response.Repository, pullRequest)))
             .ToArray();
+        options = NormalizeOptions(options);
         var bucketItems = new List<AgentReviewQueueItem>();
         var bucketLabelsByKey = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
@@ -301,6 +303,46 @@ static class AgentReviewQueueBuilder
     }
 
     internal static int ClampLimit(int limit) => Math.Clamp(limit, 1, MaxQueueLimit);
+
+    internal static DashboardOptions NormalizeOptions(DashboardOptions options) =>
+        new()
+        {
+            Repositories = NormalizeList(options.Repositories),
+            ShipWeekRepositories = NormalizeList(options.ShipWeekRepositories),
+            CoreTeamMembers = NormalizeList(options.CoreTeamMembers),
+            CoreTeamMemberAliasSuffixes = NormalizeList(options.CoreTeamMemberAliasSuffixes),
+            CommunityRepositories = NormalizeList(options.CommunityRepositories),
+            CurrentRelease = options.CurrentRelease?.Trim() ?? "",
+            ShipWeekReleaseBranch = options.ShipWeekReleaseBranch?.Trim() ?? "",
+            DocsFromCode = new DashboardDocsFromCodeOptions
+            {
+                Repository = options.DocsFromCode.Repository?.Trim() ?? "",
+                Label = options.DocsFromCode.Label?.Trim() ?? ""
+            },
+            DoNotMergeLabels = NormalizeList(options.DoNotMergeLabels),
+            BotAuthors = NormalizeList(options.BotAuthors),
+            NonBlockingCheckFailureRules = NormalizeCheckFailureRules(options.NonBlockingCheckFailureRules)
+        };
+
+    private static string[] NormalizeList(IEnumerable<string>? values) =>
+        (values ?? [])
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    private static DashboardCheckFailureRuleOptions[] NormalizeCheckFailureRules(IEnumerable<DashboardCheckFailureRuleOptions>? rules) =>
+        (rules ?? [])
+            .Where(rule => rule is not null)
+            .Select(rule => new DashboardCheckFailureRuleOptions
+            {
+                Repository = rule.Repository?.Trim() ?? "",
+                Label = rule.Label?.Trim() ?? "",
+                CheckNames = NormalizeList(rule.CheckNames),
+                CheckNameContains = NormalizeList(rule.CheckNameContains)
+            })
+            .Where(rule => rule.Repository.Length > 0 && rule.Label.Length > 0)
+            .ToArray();
 
     private static IReadOnlyList<string> ReviewBucketLabels(
         AgentReviewQueueCandidate candidate,
@@ -617,8 +659,24 @@ static class AgentReviewQueueBuilder
     private static bool IsCommunityAuthor(string author, DashboardOptions options) =>
         !IsBotAuthor(author, options) && !IsCoreTeamAuthor(author, options);
 
-    private static bool IsBotAuthor(string author, DashboardOptions options) =>
-        options.BotAuthors.Contains(author, StringComparer.OrdinalIgnoreCase);
+    private static bool IsBotAuthor(string author, DashboardOptions options)
+    {
+        if (IsCopilotAttributedAuthor(author))
+        {
+            return false;
+        }
+
+        var normalized = author.ToLowerInvariant();
+        if (normalized.EndsWith("[bot]", StringComparison.Ordinal)
+            || normalized.Contains("bot", StringComparison.Ordinal)
+            || normalized.Equals("copilot", StringComparison.Ordinal)
+            || normalized.Equals("github-actions", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return options.BotAuthors.Contains(author, StringComparer.OrdinalIgnoreCase);
+    }
 
     private static bool IsCoreTeamAuthor(string author, DashboardOptions options) =>
         MatchingCoreTeamMember(author, options) is not null;
@@ -644,22 +702,28 @@ static class AgentReviewQueueBuilder
 
     private static string? ConfiguredTeamAliasBase(string author, DashboardOptions options)
     {
+        var normalizedAuthor = StripCopilotAttribution(author);
         var suffix = options.CoreTeamMemberAliasSuffixes.FirstOrDefault(candidate =>
             !string.IsNullOrWhiteSpace(candidate)
-            && author.EndsWith(candidate, StringComparison.OrdinalIgnoreCase)
-            && author.Length > candidate.Length);
+            && normalizedAuthor.EndsWith(candidate, StringComparison.OrdinalIgnoreCase)
+            && normalizedAuthor.Length > candidate.Length);
 
-        return suffix is null ? null : author[..^suffix.Length];
+        return suffix is null ? null : normalizedAuthor[..^suffix.Length];
     }
 
     private static string ActorIdentityKey(string actor)
     {
-        var normalized = actor.ToLowerInvariant();
-        var human = normalized.EndsWith("/copilot", StringComparison.Ordinal)
-            ? normalized[..^"/copilot".Length]
-            : normalized;
+        var human = StripCopilotAttribution(actor).ToLowerInvariant();
         return string.Concat(human.Where(char.IsAsciiLetterOrDigit));
     }
+
+    private static string StripCopilotAttribution(string actor) =>
+        IsCopilotAttributedAuthor(actor)
+            ? actor[..^"/copilot".Length]
+            : actor;
+
+    private static bool IsCopilotAttributedAuthor(string actor) =>
+        actor.EndsWith("/copilot", StringComparison.OrdinalIgnoreCase);
 
     private sealed class AgentReviewQueueItemComparer(DateTimeOffset now) : IComparer<AgentReviewQueueItem>
     {
